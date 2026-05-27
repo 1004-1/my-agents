@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem \"d:\\\\Projects\\\\agent-pjt\\\\my-agents\\\\mylotto-agent\" -Force)",
+      "Bash(python -m pip install pytest pytest-cov -q)",
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(python -m pip install pandas requests rich typer -q)",
+      "Bash(git add *)",
+      "Bash(python -m pip install scikit-learn pyarrow numpy joblib -q)",
+      "Bash(python -m pytest tests/ -q --tb=short)",
+      "Bash(python main.py analyze)",
+      "Bash(python -m pip install python-dotenv -q)",
+      "Bash(python main.py build-features)",
+      "Bash(python main.py train-model)",
+      "Bash(python main.py generate --strategy model_score --n-games 5)",
+      "Bash(python main.py backtest --strategy model_score --recent 30)"
+    ]
+  }
+}
