@@ -203,18 +203,26 @@ class LottoAgent:
         for strategy_name in strategies:
             strategy = self._build_strategy(strategy_name, seed, model_path=self.model_path)
 
+            diversity: dict | None = None
             if strategy_name == "model_score":
                 games, scores = strategy.generate_with_scores(
                     n_games=n_games, history=history
                 )
+            elif strategy_name == "ensemble":
+                games, diversity = strategy.generate_with_diversity(history=history)
+                scores = {}
             else:
                 games  = strategy.generate(n_games=n_games, history=history)
                 scores = {}
 
             console.print(
-                f"\n[bold magenta]🎲 {strategy_name} 전략 — {n_games}게임[/bold magenta]"
+                f"\n[bold magenta]🎲 {strategy_name} 전략 — {len(games)}게임[/bold magenta]"
             )
             self._print_games(games, strategy_name, scores=scores)
+
+            # ensemble: 다양성 지표 추가 출력
+            if strategy_name == "ensemble" and diversity:
+                self._print_diversity(diversity)
 
             for game_no, numbers in enumerate(games, 1):
                 rows.append({
@@ -341,7 +349,7 @@ class LottoAgent:
 
         results: dict[str, BacktestResult] = {}
         for name in strategy_names:
-            model_path_arg = self.model_path if name == "model_score" else None
+            model_path_arg = self.model_path if name in ("model_score", "ensemble") else None
             result = run_backtest(
                 history=history,
                 strategy_name=name,
@@ -415,6 +423,9 @@ class LottoAgent:
             return RandomStrategy(seed=seed)
         if name_lower == "balanced":
             return BalancedStrategy(seed=seed)
+        if name_lower == "gap_based":
+            from .strategy.gap_based_strategy import GapBasedStrategy
+            return GapBasedStrategy(seed=seed)
         if name_lower == "model_score":
             if model_path is None or not model_path.exists():
                 raise ValueError(
@@ -424,8 +435,17 @@ class LottoAgent:
                 )
             from .strategy.model_score_strategy import ModelScoreStrategy
             return ModelScoreStrategy(model_path=model_path, seed=seed)
+        if name_lower == "ensemble":
+            from .strategy.ensemble_strategy import EnsembleStrategy
+            if model_path is not None and model_path.exists():
+                return EnsembleStrategy(model_path=model_path, seed=seed)
+            console.print(
+                "[dim]ℹ ensemble: 모델 없음 → model_score 서브전략 random으로 대체[/dim]"
+            )
+            return EnsembleStrategy(seed=seed)
         raise ValueError(
-            f"알 수 없는 전략: {name!r}. 사용 가능: random, balanced, model_score"
+            f"알 수 없는 전략: {name!r}. "
+            "사용 가능: random, balanced, gap_based, model_score, ensemble"
         )
 
     @staticmethod
@@ -447,6 +467,46 @@ class LottoAgent:
         for i, nums in enumerate(games, 1):
             table.add_row(str(i), *[str(n) for n in nums])
 
+        console.print(table)
+
+    @staticmethod
+    def _print_diversity(diversity: dict) -> None:
+        """앙상블 다양성 지표를 Rich 테이블로 출력한다."""
+        from rich import box as _box
+
+        cov   = diversity.get("coverage", 0.0)
+        jac   = diversity.get("avg_jaccard", 0.0)
+        score = diversity.get("diversity_score", 0.0)
+
+        table = Table(
+            title="앙상블 다양성 지표",
+            show_header=True,
+            header_style="bold cyan",
+            box=_box.SIMPLE,
+        )
+        table.add_column("지표",    style="dim",  min_width=20)
+        table.add_column("값",      justify="right")
+        table.add_column("설명",    style="dim")
+
+        cov_color   = "green" if cov >= 0.55   else "yellow" if cov >= 0.45   else "white"
+        jac_color   = "green" if jac <= 0.25   else "yellow" if jac <= 0.35   else "red"
+        score_color = "green" if score >= 70.0 else "yellow" if score >= 60.0 else "white"
+
+        table.add_row(
+            "번호 coverage",
+            f"[{cov_color}]{cov:.1%}[/{cov_color}]",
+            f"고유 번호 {int(round(cov * 45))}개 / 45",
+        )
+        table.add_row(
+            "게임간 평균 overlap",
+            f"[{jac_color}]{jac:.3f}[/{jac_color}]",
+            "Jaccard 유사도 (낮을수록 다양)",
+        )
+        table.add_row(
+            "다양성 점수",
+            f"[{score_color}]{score:.1f}[/{score_color}]",
+            "0~100 (높을수록 다양)",
+        )
         console.print(table)
 
     @staticmethod

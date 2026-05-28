@@ -43,6 +43,7 @@ class RoundResult:
     winning: list[int]            # 실제 당첨번호 6개
     bonus: int
     match_counts: list[int]      # 게임별 일치 번호 수
+    diversity: dict = field(default_factory=dict)  # coverage/avg_jaccard/diversity_score
 
     @property
     def best_match(self) -> int:
@@ -95,6 +96,26 @@ class BacktestResult:
     def match_6_count(self) -> int:
         return sum(1 for rr in self.per_round if rr.best_match == 6)
 
+    # ── 다양성 집계 ────────────────────────────────────────────────────────
+
+    @property
+    def avg_coverage(self) -> float:
+        """회차별 사용 번호 coverage 평균 (사용 고유 번호 수 / 45)."""
+        vals = [rr.diversity.get("coverage", 0.0) for rr in self.per_round if rr.diversity]
+        return float(np.mean(vals)) if vals else 0.0
+
+    @property
+    def avg_game_overlap(self) -> float:
+        """회차별 게임 간 평균 Jaccard 유사도 평균."""
+        vals = [rr.diversity.get("avg_jaccard", 0.0) for rr in self.per_round if rr.diversity]
+        return float(np.mean(vals)) if vals else 0.0
+
+    @property
+    def avg_diversity_score(self) -> float:
+        """다양성 점수 평균 (0~100, 높을수록 다양)."""
+        vals = [rr.diversity.get("diversity_score", 0.0) for rr in self.per_round if rr.diversity]
+        return float(np.mean(vals)) if vals else 0.0
+
 
 # ── 내부 유틸 ─────────────────────────────────────────────────────────────
 
@@ -129,24 +150,39 @@ def _build_strategy(
     if strategy_name == "balanced":
         return BalancedStrategy(seed=seed)
 
-    if strategy_name == "model_score":
+    if strategy_name == "gap_based":
+        from ..strategy.gap_based_strategy import GapBasedStrategy
+        return GapBasedStrategy(seed=seed)
+
+    if strategy_name in ("model_score", "ensemble"):
         from ..strategy.model_score_strategy import ModelScoreStrategy
         from .feature_builder import _compute_number_features, FEATURE_COLS
 
-        if model is None or len(past) == 0:
-            return RandomStrategy(seed=seed)
+        # 모델 없거나 과거 데이터 부족 시 랜덤 폴백 (model_score)
+        # ensemble은 model_scores=None으로 GapBased+Balanced+Random만 사용
+        scores: dict[int, float] | None = None
+        if model is not None and len(past) > 0:
+            feature_rows = [
+                [_compute_number_features(past, n)[c] for c in FEATURE_COLS]
+                for n in range(1, 46)
+            ]
+            X = np.nan_to_num(np.array(feature_rows, dtype=float), nan=0.0)
+            probs = model.predict_proba(X)[:, 1]
+            scores = {n: float(probs[n - 1]) for n in range(1, 46)}
 
-        # 경량 방식: 미리 로드된 모델로 현재 시점 feature만 계산
-        feature_rows = [
-            [_compute_number_features(past, n)[c] for c in FEATURE_COLS]
-            for n in range(1, 46)
-        ]
-        X = np.nan_to_num(np.array(feature_rows, dtype=float), nan=0.0)
-        probs = model.predict_proba(X)[:, 1]
-        scores = {n: float(probs[n - 1]) for n in range(1, 46)}
-        return ModelScoreStrategy.from_scores(scores, seed=seed)
+        if strategy_name == "model_score":
+            if scores is None:
+                return RandomStrategy(seed=seed)
+            return ModelScoreStrategy.from_scores(scores, seed=seed)
 
-    raise ValueError(f"알 수 없는 전략: {strategy_name!r}")
+        # ensemble
+        from ..strategy.ensemble_strategy import EnsembleStrategy
+        return EnsembleStrategy(model_scores=scores, seed=seed)
+
+    raise ValueError(
+        f"알 수 없는 전략: {strategy_name!r}. "
+        "사용 가능: random, balanced, gap_based, model_score, ensemble"
+    )
 
 
 # ── 핵심 공개 API ─────────────────────────────────────────────────────────
@@ -206,7 +242,7 @@ def run_backtest(
         f"{n_games}게임/회차"
     )
 
-    # model_score: 모델 미리 로드
+    # model_score / ensemble: 모델 미리 로드
     model: Any = None
     if strategy_name == "model_score":
         if model_path is None:
@@ -216,6 +252,14 @@ def run_backtest(
             )
         from .model_trainer import load_model
         model = load_model(model_path)
+    elif strategy_name == "ensemble":
+        if model_path is not None and Path(model_path).exists():
+            from .model_trainer import load_model
+            model = load_model(model_path)
+        else:
+            console.print(
+                "[dim]ℹ ensemble: 모델 파일 없음 → model_score 서브전략 random으로 대체[/dim]"
+            )
 
     result = BacktestResult(strategy=strategy_name, total_rounds=len(target_rounds))
     t0 = time.monotonic()
@@ -247,6 +291,10 @@ def run_backtest(
             winning_set  = set(winning)
             match_counts = [len(set(g) & winning_set) for g in games]
 
+            # 다양성 지표 계산
+            from ..strategy.ensemble_strategy import compute_diversity
+            diversity = compute_diversity(games)
+
             result.per_round.append(RoundResult(
                 round_no=round_no,
                 strategy=strategy_name,
@@ -254,6 +302,7 @@ def run_backtest(
                 winning=winning,
                 bonus=bonus,
                 match_counts=match_counts,
+                diversity=diversity,
             ))
 
             best  = max(match_counts)
@@ -334,6 +383,30 @@ def print_backtest_summary(result: BacktestResult, elapsed: float = 0.0) -> None
     # 등수 요약
     prize_str = "  ".join(f"{k}:{v}" for k, v in prize.items() if v > 0)
     table.add_row("등수 요약", prize_str or "꽝만 있음")
+
+    # 다양성 지표
+    table.add_row("", "")  # 구분 공백
+    cov_pct   = result.avg_coverage * 100
+    overlap   = result.avg_game_overlap
+    div_score = result.avg_diversity_score
+    cov_color = "green" if cov_pct >= 55 else "yellow" if cov_pct >= 45 else "dim"
+    ovl_color = "green" if overlap <= 0.25 else "yellow" if overlap <= 0.35 else "red"
+    div_color = "green" if div_score >= 70 else "yellow" if div_score >= 60 else "dim"
+    table.add_row(
+        "번호 coverage",
+        f"[{cov_color}]{cov_pct:.1f}%[/{cov_color}]  "
+        f"[dim](고유 번호 수 / 45 평균)[/dim]",
+    )
+    table.add_row(
+        "게임간 평균 overlap",
+        f"[{ovl_color}]{overlap:.3f}[/{ovl_color}]  "
+        f"[dim](Jaccard 유사도, 낮을수록 다양)[/dim]",
+    )
+    table.add_row(
+        "다양성 점수",
+        f"[{div_color}]{div_score:.1f}[/{div_color}]  "
+        f"[dim](0~100, 높을수록 좋음)[/dim]",
+    )
 
     if elapsed > 0:
         table.add_row("소요 시간", f"{elapsed:.1f}초")

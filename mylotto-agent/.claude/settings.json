@@ -14,6 +14,9 @@
       "Bash(python main.py train-model)",
       "Bash(python main.py generate --strategy model_score --n-games 5)",
       "Bash(python main.py backtest --strategy model_score --recent 30)"
+    ],
+    "additionalDirectories": [
+      "d:\\Projects\\agent-pjt\\my-agents"
     ]
   }
 }
