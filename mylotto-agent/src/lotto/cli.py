@@ -130,24 +130,82 @@ def show(
 
 @app.command()
 def run(
-    n_games:      Annotated[int, typer.Option("--n-games", "-n")] = 5,
+    random_games: Annotated[
+        int, typer.Option("--random-games", help="random 전략 게임 수")
+    ] = 5,
+    balanced_games: Annotated[
+        int, typer.Option("--balanced-games", help="balanced 전략 게임 수")
+    ] = 5,
+    total_games: Annotated[
+        Optional[int],
+        typer.Option("--total-games", help="총 게임 수 (random+balanced 균등 분배, 개별 옵션보다 우선)"),
+    ] = None,
+    balanced_v2_games: Annotated[
+        int, typer.Option("--balanced-v2-games", help="balanced_v2 전략 게임 수 (기본 0)")
+    ] = 0,
+    model_score_games: Annotated[
+        int, typer.Option("--model-score-games", help="[실험적] model_score 전략 게임 수 (기본 0)")
+    ] = 0,
+    ensemble_games: Annotated[
+        int, typer.Option("--ensemble-games", help="[실험적] ensemble 전략 게임 수 — 항상 5게임 고정 (기본 0)")
+    ] = 0,
     results:      ResultsCsvOpt = _DEFAULT_RESULTS,
     games:        GamesCsvOpt   = _DEFAULT_GAMES,
+    model:        ModelOpt      = _DEFAULT_MODEL,
     seed:         Annotated[Optional[int], typer.Option("--seed")] = None,
     skip_collect: Annotated[
         bool, typer.Option("--skip-collect", help="수집 건너뜀 (오프라인 모드)")
     ] = False,
     verbose: VerboseOpt = False,
 ) -> None:
-    """🚀 수집 → 생성을 한 번에 실행하는 올인원 커맨드."""
+    """🚀 수집 → 생성을 한 번에 실행하는 주간 올인원 커맨드.
+
+    기본: random 5게임 + balanced 5게임 = 총 10게임.
+    전략 간 Jaccard ≥ 0.7인 게임(4개↑ 공유)을 자동으로 재생성해 중복을 방지한다.
+
+    예시:
+
+        python main.py run
+        python main.py run --random-games 7 --balanced-games 3
+        python main.py run --total-games 10
+        python main.py run --balanced-v2-games 5 --random-games 0 --balanced-games 5
+        python main.py run --random-games 4 --balanced-games 4 --model-score-games 2
+        python main.py run --skip-collect
+    """
     _setup_logging(verbose)
-    agent = _make_agent(results, games)
+    agent = _make_agent(results, games, model=model)
+
     if not skip_collect:
         try:
             agent.collect()
         except Exception as exc:
             console.print(f"[yellow]⚠ 수집 실패 (로컬 데이터 사용): {exc}[/yellow]")
-    agent.generate(n_games=n_games, strategies=["random", "balanced"], seed=seed)
+
+    # --total-games: random+balanced 균등 분배 (개별 옵션 무시)
+    if total_games is not None:
+        balanced_games = total_games // 2
+        random_games   = total_games - balanced_games
+
+    # 전략별 게임 수 dict (0 이하는 제외)
+    strategy_games: dict[str, int] = {}
+    if random_games      > 0: strategy_games["random"]       = random_games
+    if balanced_games    > 0: strategy_games["balanced"]      = balanced_games
+    if balanced_v2_games > 0: strategy_games["balanced_v2"]   = balanced_v2_games
+    if model_score_games > 0: strategy_games["model_score"]   = model_score_games
+    if ensemble_games    > 0: strategy_games["ensemble"]      = ensemble_games
+
+    if not strategy_games:
+        console.print(
+            "[red]생성할 게임이 없습니다. "
+            "--random-games 또는 --balanced-games를 1 이상으로 설정하세요.[/red]"
+        )
+        raise typer.Exit(1)
+
+    agent.generate(
+        strategy_games=strategy_games,
+        seed=seed,
+        cross_dedup=True,
+    )
 
 
 @app.command()

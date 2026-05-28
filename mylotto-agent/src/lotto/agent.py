@@ -193,39 +193,67 @@ class LottoAgent:
         n_games: int = 5,
         strategies: list[str] | None = None,
         seed: int | None = None,
+        *,
+        strategy_games: dict[str, int] | None = None,
+        cross_dedup: bool = False,
     ) -> pd.DataFrame:
-        """전략별로 로또 번호를 생성하고 CSV에 저장한다."""
-        if strategies is None:
-            strategies = ["random", "balanced"]
+        """전략별로 로또 번호를 생성하고 CSV에 저장한다.
+
+        Args:
+            n_games:        전략당 생성 게임 수 (strategy_games 미지정 시 사용)
+            strategies:     전략 목록 (strategy_games 미지정 시 사용)
+            seed:           랜덤 시드
+            strategy_games: 전략별 게임 수 dict e.g. {"random": 5, "balanced": 5}
+                            지정 시 n_games/strategies를 무시한다.
+            cross_dedup:    전략 간 과도한 번호 겹침 방지 여부 (Jaccard ≥ 0.7 게임 재생성)
+        """
+        from .strategy.ensemble_strategy import compute_diversity
+
+        # ── 전략·게임 수 결정 ──────────────────────────────────────────────
+        if strategy_games is None:
+            if strategies is None:
+                strategies = ["random", "balanced"]
+            strategy_games = {s: n_games for s in strategies}
+        strategy_games = {k: v for k, v in strategy_games.items() if v > 0}
+        if not strategy_games:
+            console.print("[red]생성할 게임이 없습니다.[/red]")
+            return pd.DataFrame()
 
         history      = self.storage.load_results()
         generated_at = datetime.now(tz=timezone.utc).isoformat()
 
+        # ── 헤더 출력 ──────────────────────────────────────────────────────
+        label_parts = [f"{name} {n}게임" for name, n in strategy_games.items()]
+        total_n = sum(strategy_games.values())
+        console.rule(f"[bold cyan]🎱 로또 번호 생성  총 {total_n}게임[/bold cyan]")
+        console.print(f"  [dim]{' + '.join(label_parts)}[/dim]")
+
+        all_sets: list[frozenset[int]] = []   # cross-dedup용 누적
         rows: list[dict] = []
-        for strategy_name in strategies:
+        strategy_results: list[tuple[str, list[list[int]], dict]] = []
+
+        for strategy_name, n in strategy_games.items():
             strategy = self._build_strategy(strategy_name, seed, model_path=self.model_path)
 
-            diversity: dict | None = None
-            if strategy_name == "model_score":
-                games, scores = strategy.generate_with_scores(
-                    n_games=n_games, history=history
+            # 게임 생성
+            games = strategy.generate(n_games=n, history=history)
+
+            # 전략 간 중복·과도한 겹침 제거
+            if cross_dedup and all_sets:
+                games = self._cross_dedup_games(
+                    games, all_sets, strategy, history, max_jaccard=0.7
                 )
-            elif strategy_name == "ensemble":
-                games, diversity = strategy.generate_with_diversity(history=history)
-                scores = {}
-            else:
-                games  = strategy.generate(n_games=n_games, history=history)
-                scores = {}
 
-            console.print(
-                f"\n[bold magenta]🎲 {strategy_name} 전략 — {len(games)}게임[/bold magenta]"
-            )
-            self._print_games(games, strategy_name, scores=scores)
+            all_sets.extend(frozenset(g) for g in games)
 
-            # ensemble: 다양성 지표 추가 출력
-            if strategy_name == "ensemble" and diversity:
-                self._print_diversity(diversity)
+            # 다양성 지표 계산
+            diversity = compute_diversity(games)
+            strategy_results.append((strategy_name, games, diversity))
 
+            # 출력
+            self._print_strategy_section(strategy_name, games, diversity)
+
+            # CSV 행 누적
             for game_no, numbers in enumerate(games, 1):
                 rows.append({
                     "generated_at": generated_at,
@@ -234,6 +262,10 @@ class LottoAgent:
                     "num1": numbers[0], "num2": numbers[1], "num3": numbers[2],
                     "num4": numbers[3], "num5": numbers[4], "num6": numbers[5],
                 })
+
+        # ── 전략 간 종합 요약 ──────────────────────────────────────────────
+        if len(strategy_results) >= 2:
+            self._print_combined_summary(strategy_results)
 
         games_df = pd.DataFrame(rows)
         self.storage.append_games(games_df)
@@ -523,11 +555,118 @@ class LottoAgent:
         )
 
     @staticmethod
+    def _cross_dedup_games(
+        games: list[list[int]],
+        existing: list[frozenset[int]],
+        strategy,
+        history: pd.DataFrame,
+        max_jaccard: float = 0.7,
+        max_attempts: int = 30,
+    ) -> list[list[int]]:
+        """기존 게임들과 과도하게 겹치는 게임을 새 게임으로 교체한다.
+
+        Jaccard ≥ max_jaccard (≈ 4개 이상 공유)인 게임을 최대 max_attempts번
+        재생성하여 교체한다. 실패 시 원본을 유지한다.
+        """
+        result: list[list[int]] = []
+        for game in games:
+            game_set = frozenset(game)
+            max_j = max(
+                (len(game_set & ex) / len(game_set | ex) for ex in existing),
+                default=0.0,
+            )
+            if max_j < max_jaccard:
+                result.append(game)
+                continue
+            # 임계값 초과 → 재생성 시도
+            replaced = False
+            for _ in range(max_attempts):
+                new_games = strategy.generate(n_games=1, history=history)
+                if not new_games:
+                    break
+                new_set = frozenset(new_games[0])
+                new_j = max(
+                    (len(new_set & ex) / len(new_set | ex) for ex in existing),
+                    default=0.0,
+                )
+                if new_j < max_jaccard:
+                    result.append(new_games[0])
+                    replaced = True
+                    break
+            if not replaced:
+                result.append(game)   # 대체 실패 → 원본 유지
+        return result
+
+    @staticmethod
+    def _print_strategy_section(
+        strategy_name: str,
+        games: list[list[int]],
+        diversity: dict,
+    ) -> None:
+        """전략 섹션 헤더(다양성 지표) + 게임 테이블을 출력한다."""
+        cov    = diversity.get("coverage", 0.0)
+        div    = diversity.get("diversity_score", 0.0)
+        unique = int(round(cov * 45))
+
+        cov_color = "green" if cov >= 0.55 else "yellow" if cov >= 0.45 else "white"
+        div_color = "green" if div >= 70   else "yellow" if div >= 60   else "dim"
+
+        console.print(
+            f"\n[bold magenta]🎲 {strategy_name}[/bold magenta]  "
+            f"[dim]{len(games)}게임[/dim]"
+            f"  cover [bold {cov_color}]{cov:.1%}[/bold {cov_color}] ({unique}/45)"
+            f"  다양성 [{div_color}]{div:.1f}[/{div_color}]"
+        )
+
+        table = Table(
+            show_header=True,
+            header_style="bold blue",
+            box=box.SIMPLE_HEAD,
+            padding=(0, 1),
+        )
+        table.add_column("#", style="dim", min_width=2, no_wrap=True)
+        for i in range(1, 7):
+            # "번호N": 번(2셀)+호(2셀)+N(1셀) = 5셀 → min_width=5
+            table.add_column(f"번호{i}", justify="right", min_width=5, no_wrap=True)
+        for i, nums in enumerate(games, 1):
+            table.add_row(str(i), *[str(n) for n in nums])
+        console.print(table)
+
+    @staticmethod
+    def _print_combined_summary(
+        strategy_results: list[tuple[str, list[list[int]], dict]],
+    ) -> None:
+        """전략 간 결합 통계(총 고유번호·평균 유사도)를 출력한다."""
+        from .strategy.ensemble_strategy import compute_diversity
+
+        all_games: list[list[int]] = []
+        for _, games, _ in strategy_results:
+            all_games.extend(games)
+
+        ov   = compute_diversity(all_games)
+        cov  = ov["coverage"]
+        jacc = ov["avg_jaccard"]
+        div  = ov["diversity_score"]
+        uniq = int(round(cov * 45))
+
+        cov_color  = "green" if cov  >= 0.60 else "yellow" if cov  >= 0.50 else "dim"
+        jacc_color = "green" if jacc <= 0.25 else "yellow" if jacc <= 0.35 else "red"
+        div_color  = "green" if div  >= 70   else "yellow" if div  >= 60   else "dim"
+
+        console.rule("[dim]📊 종합[/dim]")
+        console.print(
+            f"  총 고유번호 [{cov_color}]{uniq}/45 ({cov:.1%})[/{cov_color}]"
+            f"  |  게임 간 평균 유사도 [{jacc_color}]{jacc:.3f}[/{jacc_color}]"
+            f"  |  종합 다양성 [{div_color}]{div:.1f}[/{div_color}]"
+        )
+
+    @staticmethod
     def _print_games(
         games: list[list[int]],
         strategy: str,
         scores: dict[int, float] | None = None,
     ) -> None:
+        """레거시 호환용. 새 코드는 _print_strategy_section을 사용한다."""
         table = Table(
             title=f"전략: {strategy}",
             show_header=True,
@@ -537,10 +676,8 @@ class LottoAgent:
         table.add_column("게임", style="dim", width=6)
         for i in range(1, 7):
             table.add_column(f"번호{i}", justify="right")
-
         for i, nums in enumerate(games, 1):
             table.add_row(str(i), *[str(n) for n in nums])
-
         console.print(table)
 
     @staticmethod
