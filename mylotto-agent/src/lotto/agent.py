@@ -423,6 +423,9 @@ class LottoAgent:
             return RandomStrategy(seed=seed)
         if name_lower == "balanced":
             return BalancedStrategy(seed=seed)
+        if name_lower == "balanced_v2":
+            from .strategy.balanced_v2_strategy import BalancedV2Strategy
+            return BalancedV2Strategy(seed=seed)
         if name_lower == "gap_based":
             from .strategy.gap_based_strategy import GapBasedStrategy
             return GapBasedStrategy(seed=seed)
@@ -445,7 +448,7 @@ class LottoAgent:
             return EnsembleStrategy(seed=seed)
         raise ValueError(
             f"알 수 없는 전략: {name!r}. "
-            "사용 가능: random, balanced, gap_based, model_score, ensemble"
+            "사용 가능: random, balanced, balanced_v2, gap_based, model_score, ensemble"
         )
 
     @staticmethod

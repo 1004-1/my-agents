@@ -69,6 +69,7 @@ def _build_appeared_matrix(history: pd.DataFrame) -> np.ndarray:
 def build_features(
     history: pd.DataFrame,
     min_history_rounds: int = 20,
+    quiet: bool = False,
 ) -> pd.DataFrame:
     """전체 history에서 leakage-free feature 행렬을 생성한다.
 
@@ -79,6 +80,7 @@ def build_features(
     Args:
         history:              DRAW_COLUMNS 형식의 당첨번호 DataFrame (round_no 오름차순)
         min_history_rounds:   feature 계산에 필요한 최소 과거 회차 수
+        quiet:                True이면 콘솔 출력을 억제한다 (배치 사전 계산용)
 
     Returns:
         DataFrame, columns = OUTPUT_COLS
@@ -101,10 +103,11 @@ def build_features(
     t_start = time.monotonic()
     n_target = n_rounds - min_history_rounds
 
-    console.print(
-        f"[cyan]Feature 생성: {n_rounds:,}회차 × 45번호 "
-        f"(학습 시작 인덱스: {min_history_rounds})[/cyan]"
-    )
+    if not quiet:
+        console.print(
+            f"[cyan]Feature 생성: {n_rounds:,}회차 × 45번호 "
+            f"(학습 시작 인덱스: {min_history_rounds})[/cyan]"
+        )
 
     # ── 1. appeared 행렬 ──────────────────────────────────────────────
     appeared = _build_appeared_matrix(history)
@@ -150,40 +153,20 @@ def build_features(
     numbers = np.arange(1, 46, dtype=np.int8)  # 1..45
 
     # ── 6. 메인 루프 (회차 단위, 번호 축은 벡터화) ───────────────────
-    with Progress(
-        SpinnerColumn(spinner_name="dots"),
-        TextColumn("[bold cyan]{task.description}"),
-        BarColumn(bar_width=36),
-        MofNCompleteColumn(),
-        TaskProgressColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-        transient=False,
-    ) as progress:
-        task = progress.add_task("Feature 계산 중", total=n_target)
-
+    def _run_main_loop(progress_ctx):
+        task = progress_ctx.add_task("Feature 계산 중", total=n_target) if progress_ctx else None
         for k, i in enumerate(range(min_history_rounds, n_rounds)):
             s, e = k * 45, k * 45 + 45
-
             arr_round[s:e]  = round_nos[i]
             arr_num[s:e]    = numbers
             arr_target[s:e] = appeared[i].astype(np.int8)
-
-            # total frequency (과거 i 회차 누적)
-            arr_tf[s:e] = cum[i].astype(np.float32) / float(i)
-
-            # recent frequencies
+            arr_tf[s:e]     = cum[i].astype(np.float32) / float(i)
             for kk, arr_r in ((10, arr_r10), (30, arr_r30), (50, arr_r50), (100, arr_r100)):
                 start_i = max(0, i - kk)
                 window  = float(i - start_i)
                 arr_r[s:e] = (cum[i] - cum[start_i]).astype(np.float32) / window
-
-            # gap since last seen
             ls = last_seen[i]
             arr_gap[s:e] = np.where(ls >= 0, (i - 1) - ls, i).astype(np.int32)
-
-            # rolling avg gap
             ng = n_gaps[i]
             sg = sum_gaps[i]
             arr_avg[s:e] = np.where(
@@ -191,11 +174,25 @@ def build_features(
                 (sg.astype(np.float64) / np.maximum(ng, 1)).astype(np.float32),
                 np.float32(i),
             )
-
-            # appeared in previous round
             arr_prev[s:e] = appeared[i - 1].astype(np.int8)
+            if progress_ctx and task is not None:
+                progress_ctx.advance(task)
 
-            progress.advance(task)
+    if quiet:
+        _run_main_loop(None)
+    else:
+        with Progress(
+            SpinnerColumn(spinner_name="dots"),
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(bar_width=36),
+            MofNCompleteColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=False,
+        ) as progress:
+            _run_main_loop(progress)
 
     # 정적 feature (모든 회차 동일)
     arr_mod2   = np.tile(numbers % 2, n_target).astype(np.int8)
@@ -218,10 +215,11 @@ def build_features(
     })
 
     elapsed = time.monotonic() - t_start
-    console.print(
-        f"[green]✓ Feature 생성 완료: {len(df):,}행 "
-        f"({n_target:,}회차 × 45번호)  소요: {elapsed:.1f}초[/green]"
-    )
+    if not quiet:
+        console.print(
+            f"[green]✓ Feature 생성 완료: {len(df):,}행 "
+            f"({n_target:,}회차 × 45번호)  소요: {elapsed:.1f}초[/green]"
+        )
     logger.info("Feature 생성: %d행, %.1f초", len(df), elapsed)
     return df
 

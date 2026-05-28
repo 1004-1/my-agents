@@ -100,7 +100,7 @@ def generate(
     n_games:  Annotated[int, typer.Option("--n-games", "-n", help="생성할 게임 수")] = 5,
     strategy: Annotated[
         Optional[list[str]],
-        typer.Option("--strategy", "-s", help="전략 (random/balanced/gap_based/model_score/ensemble, 반복 가능)"),
+        typer.Option("--strategy", "-s", help="전략 (random/balanced/balanced_v2/gap_based/model_score/ensemble, 반복 가능)"),
     ] = None,
     seed:    Annotated[Optional[int], typer.Option("--seed", help="랜덤 시드")] = None,
     results: ResultsCsvOpt = _DEFAULT_RESULTS,
@@ -198,7 +198,7 @@ def train_model(
 def backtest(
     strategy: Annotated[
         Optional[list[str]],
-        typer.Option("--strategy", "-s", help="전략명 (random/balanced/gap_based/model_score/ensemble, 반복 가능)"),
+        typer.Option("--strategy", "-s", help="전략명 (random/balanced/balanced_v2/gap_based/model_score/ensemble, 반복 가능)"),
     ] = None,
     start:   Annotated[Optional[int], typer.Option("--start-round", help="시작 회차")] = None,
     end:     Annotated[Optional[int], typer.Option("--end-round",   help="종료 회차")] = None,
@@ -222,7 +222,7 @@ def backtest(
 
         python main.py backtest --strategy random
         python main.py backtest --strategy model_score --recent 100
-        python main.py backtest -s random -s balanced --start-round 1100
+        python main.py backtest -s random -s balanced -s balanced_v2 --recent 300
     """
     _setup_logging(verbose)
     strategies = strategy or ["random"]

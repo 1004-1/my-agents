@@ -99,11 +99,13 @@ class EnsembleStrategy(BaseStrategy):
         self,
         model_path: Path | str | None = None,
         model_scores: dict[int, float] | None = None,
+        gap_weights: "np.ndarray | None" = None,
         seed: int | None = None,
         max_jaccard: float = 0.5,
     ):
         self._model_path   = Path(model_path) if model_path else None
         self._model_scores = dict(model_scores) if model_scores else None
+        self._gap_weights  = np.array(gap_weights) if gap_weights is not None else None
         self._rng          = random.Random(seed)
         self._np_rng       = np.random.default_rng(seed)
         self._max_jaccard  = max_jaccard
@@ -175,7 +177,11 @@ class EnsembleStrategy(BaseStrategy):
                 sub = RandomStrategy(seed=sub_seed)
 
             elif strategy_name == "gap_based":
-                sub = GapBasedStrategy(seed=sub_seed)
+                if self._gap_weights is not None:
+                    # 백테스트 경량 모드: 사전 계산 가중치 사용
+                    sub = GapBasedStrategy.from_weights(self._gap_weights, seed=sub_seed)
+                else:
+                    sub = GapBasedStrategy(seed=sub_seed)
 
             else:
                 logger.warning("알 수 없는 서브전략: %s → random", strategy_name)

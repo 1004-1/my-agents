@@ -13,7 +13,13 @@
       "Bash(python main.py build-features)",
       "Bash(python main.py train-model)",
       "Bash(python main.py generate --strategy model_score --n-games 5)",
-      "Bash(python main.py backtest --strategy model_score --recent 30)"
+      "Bash(python main.py backtest --strategy model_score --recent 30)",
+      "PowerShell(cd \"d:\\\\Projects\\\\agent-pjt\\\\my-agents\\\\mylotto-agent\"; $sw = [System.Diagnostics.Stopwatch]::StartNew\\(\\); python main.py backtest --strategy ensemble --recent 50 2>&1 | Select-Object -Last 30; $sw.Stop\\(\\); Write-Host \"Total wall time: $\\($sw.Elapsed.TotalSeconds\\)s\")",
+      "PowerShell(cd \"d:\\\\Projects\\\\agent-pjt\\\\my-agents\\\\mylotto-agent\"; $sw = [System.Diagnostics.Stopwatch]::StartNew\\(\\); python main.py backtest --strategy ensemble --recent 300 2>&1 | Select-Object -Last 30; $sw.Stop\\(\\); Write-Host \"Total wall time: $\\($sw.Elapsed.TotalSeconds\\)s\")",
+      "PowerShell(cd \"d:\\\\Projects\\\\agent-pjt\\\\my-agents\\\\mylotto-agent\"; $sw = [System.Diagnostics.Stopwatch]::StartNew\\(\\); python main.py backtest -s random -s balanced -s model_score -s ensemble --recent 300 2>&1 | Select-String \"소요|백테스트 결과|전략|Total\" | Select-Object -First 30; $sw.Stop\\(\\); Write-Host \"Total wall time: $\\($sw.Elapsed.TotalSeconds\\)s\")",
+      "Bash(time python main.py backtest --strategy ensemble --recent 50)",
+      "Bash(python -m pytest tests/test_balanced_v2_strategy.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_gap_strategy.py -v --tb=short)"
     ],
     "additionalDirectories": [
       "d:\\Projects\\agent-pjt\\my-agents"

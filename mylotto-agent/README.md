@@ -30,10 +30,13 @@ Python 기반 로또 번호 생성 & 학습 기반 번호 생성 실험 플랫�
 | `data/lotto_draw_results.csv` 증분 업데이트 | ✅ |
 | 순수 랜덤 전략 (RandomStrategy) | ✅ |
 | 균형 전략 (BalancedStrategy — 구간/홀짝/빈도) | ✅ |
+| **고도화 균형 전략 (BalancedV2Strategy)** | ✅ |
 | **번호별 통계 분석 (analyze)** | ✅ |
 | **Leakage-free Feature 생성 (build-features)** | ✅ |
 | **LogisticRegression 모델 학습 (train-model)** | ✅ |
 | **모델 score 기반 전략 (model_score)** | ✅ |
+| **Gap 기반 전략 (GapBasedStrategy)** | ✅ |
+| **앙상블 전략 (EnsembleStrategy)** | ✅ |
 | **전략별 백테스트 (backtest)** | ✅ |
 | `data/generated_games.csv` 저장 | ✅ |
 | Telegram Bot 알림 | 🔲 skeleton |
@@ -71,8 +74,8 @@ backtest: 회차 t에서 history[round_no < t]만 전략에 전달 (leakage 차�
 | `analysis/` | 번호별 통계 분석 (StatsAnalyzer) |
 | `ml/feature_builder.py` | Leakage-free feature 행렬 생성 |
 | `ml/model_trainer.py` | LogisticRegression 시간순 학습 |
-| `ml/backtest.py` | 전략별 과거 성능 검증 |
-| `strategy/` | BaseStrategy + 3개 구현체 (random / balanced / model_score) |
+| `ml/backtest.py` | 전략별 과거 성능 검증 (배치 사전 계산으로 고속화) |
+| `strategy/` | BaseStrategy + 6개 구현체 (random / balanced / balanced_v2 / gap_based / model_score / ensemble) |
 | `storage/` | 로컬 CSV / parquet I/O |
 | `agent.py` | 오케스트레이터 (단일 인터페이스) |
 | `cli.py` | Typer CLI 커맨드 정의 |
@@ -120,7 +123,10 @@ mylotto-agent/
 │   │   ├── base.py                  # 추상 BaseStrategy
 │   │   ├── random_strategy.py       # 순수 랜덤
 │   │   ├── balanced_strategy.py     # 균형 전략
-│   │   └── model_score_strategy.py  # 모델 score 기반 전략
+│   │   ├── balanced_v2_strategy.py  # 고도화 균형 전략 (엄격한 제약 + 다양성)
+│   │   ├── gap_based_strategy.py    # Gap 기반 전략 (미출현 번호 가중치)
+│   │   ├── model_score_strategy.py  # 모델 score 기반 전략
+│   │   └── ensemble_strategy.py     # 앙상블 전략 (5전략 혼합)
 │   │
 │   ├── storage/
 │   │   ├── local_storage.py         # 로컬 CSV I/O
@@ -143,6 +149,9 @@ mylotto-agent/
     ├── test_stats.py                # 통계 분석 테스트
     ├── test_backtest.py             # 백테스트 엔진 테스트
     ├── test_model_strategy.py       # ModelScoreStrategy 테스트
+    ├── test_gap_strategy.py         # GapBasedStrategy 테스트
+    ├── test_ensemble_strategy.py    # EnsembleStrategy + compute_diversity 테스트
+    ├── test_balanced_v2_strategy.py # BalancedV2Strategy 테스트 (43개)
     ├── test_strategy.py
     ├── test_storage.py
     └── test_validator.py
@@ -276,14 +285,17 @@ python main.py train-model --C 0.5
 ### 5. 번호 생성
 
 ```bash
-# random + balanced 각 5게임
+# random + balanced 각 5게임 (기본)
 python main.py generate
+
+# balanced_v2 전략 5게임
+python main.py generate --strategy balanced_v2
 
 # model_score 전략 5게임
 python main.py generate --strategy model_score
 
 # 전략 조합 + 게임 수 지정
-python main.py generate --strategy random --strategy model_score --n-games 3
+python main.py generate --strategy random --strategy balanced_v2 --n-games 3
 
 # 재현 가능한 시드
 python main.py generate --seed 42
@@ -305,18 +317,50 @@ python main.py backtest --strategy random
 # 최근 30회차 model_score 백테스트
 python main.py backtest --strategy model_score --recent 30
 
+# ensemble 전략 (gap_based + model_score + balanced + random 혼합)
+python main.py backtest --strategy ensemble --recent 50
+python main.py backtest --strategy ensemble --recent 300
+
 # 특정 회차 범위
 python main.py backtest --strategy balanced --start-round 1100 --end-round 1200
 
-# 여러 전략 비교
-python main.py backtest -s random -s balanced -s model_score --recent 50
+# 3개 전략 동시 비교 (300회차 기준 약 3초)
+python main.py backtest -s random -s balanced -s balanced_v2 --recent 300
+
+# 전체 전략 비교 (300회차 기준 약 9초)
+python main.py backtest -s random -s balanced -s balanced_v2 -s model_score -s ensemble --recent 300
 
 # 게임 수 지정 + 저장 없이 실행
 python main.py backtest --strategy random --n-games 10 --no-save
 ```
 
-**주의사항**: model_score 전략 백테스트는 **매 회차 모델을 재학습하지 않고**,
+**주의사항**: model_score / ensemble 전략 백테스트는 **매 회차 모델을 재학습하지 않고**,
 사전 학습된 모델로 각 회차 t-1까지의 feature를 즉석 계산하는 경량 방식으로 동작합니다.
+
+#### 백테스트 성능
+
+배치 사전 계산(Batch Pre-computation) 최적화 적용:
+
+| 전략 | 최적화 전 (recent 300) | 최적화 후 (recent 300) | 속도 향상 |
+| --- | --- | --- | --- |
+| random | ~0.1초 | ~0.1초 | — |
+| balanced | ~0.8초 | ~0.8초 | — |
+| model_score | ~18분 | ~0.5초 | **~2,000×** |
+| gap_based | ~5분 | ~0.3초 | **~1,000×** |
+| ensemble | ~20분 | ~3초 | **~420×** |
+| **4전략 합계** | **~40분** | **~9초** | **~270×** |
+
+**최적화 원리**:
+
+1. **Feature 배치 계산**: 기존에는 회차마다 45번호 × `_compute_number_features()` 호출 (O(45 × n_past) pandas 스캔). 최적화 후 `build_features()`로 전체 feature 행렬을 벡터화 numpy 연산으로 1회 생성.
+
+2. **배치 predict_proba**: `model.predict_proba(300 × 45 = 13,500 samples)` 를 단일 호출로 처리.
+
+3. **Gap 가중치 누적 행렬**: `last_seen[i, n]` 누적 행렬을 1회 빌드 후 O(1) 조회. 기존 회차별 history 전체 스캔 제거.
+
+4. **DataFrame view 사용**: `history[...].copy()` → `history.iloc[:cur_idx]` (view, O(1)).
+
+5. **round_no → index 캐시**: `dict` 기반 O(1) 인덱스 조회로 `history[history["round_no"] == round_no]` 반복 제거.
 
 ### 8. 올인원 실행
 
@@ -366,6 +410,55 @@ python main.py run --skip-collect
 | 연속 제한 | 3개 이상 연속 번호 없음 |
 | 빈도 가중치 | 과거 출현 빈도를 가중치로 반영 |
 
+### `balanced_v2` — 고도화 균형 전략
+
+기존 `balanced` 대비 더 엄격한 제약과 최근 빈도 가중치, 게임 간 다양성 보장을 추가한 고도화 전략.
+
+| 규칙 | 내용 |
+| --- | --- |
+| 홀짝 균형 | 홀수 2:4 / 3:3 / 4:2 만 허용 |
+| 합계 범위 | history 실제 분포 5th~95th 백분위 (동적) |
+| 십단위 구간 | 구간당 최대 3개 & 최소 3구간 커버 |
+| 연속 제한 | 3개 이상 연속 번호 없음 |
+| 끝자리 제한 | 같은 끝자리 최대 2개 |
+| 이전 회차 겹침 | 직전 회차 번호와 최대 2개 겹침 |
+| 핫 번호 제한 | 최근 5회차 2회↑ 출현 번호 최대 3개 |
+| 게임 간 다양성 | Jaccard 유사도 ≤ 0.5 보장 (후처리) |
+| 빈도 가중치 | 최근 100회차 출현 빈도 가중치 |
+
+**백테스트 비교 (최근 300회차 기준)**:
+
+| 전략 | 3개↑ 회차 | 4개↑ 회차 | 평균 합계 | 홀짝 분포 | 평균 십단위 구간 | 연속번호 포함 | 소요 시간 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| random | 39회 (13.0%) | 1회 | 137.4 | 홀0~6 | 3.76 | 52.4% | 0.1초 |
+| balanced | 32회 (10.7%) | 4회 | 143.2 | 홀2~4 | 4.39 | 43.8% | 0.7초 |
+| balanced_v2 | 32회 (10.7%) | 3회 | 141.5 | 홀2~4 | 4.09 | 47.8% | 1.6초 |
+
+> 로또는 독립 확률이므로 단기 샘플(300회차)에서의 차이는 통계적 노이즈 범위입니다.
+
+### `gap_based` — Gap 기반 전략
+
+최근 장기간 미출현 번호에 가중치를 부여하되, 극단적 집중을 소프트맥스 temperature로 방지합니다.
+
+| 파라미터 | 기본값 | 설명 |
+| --- | --- | --- |
+| `alpha` | 1.2 | gap 가중치 지수 (높을수록 미출현 번호 선호) |
+| `temperature` | 2.0 | 소프트맥스 온도 (높을수록 균등) |
+| `max_gap_ratio` | 2.5 | gap 클리핑 임계값 (극단 집중 방지) |
+
+### `ensemble` — 앙상블 전략
+
+5가지 서브전략을 혼합하여 번호 커버리지를 높이는 실험적 접근입니다.
+
+| 서브전략 | 게임 수 |
+| --- | --- |
+| model_score | 2게임 |
+| balanced | 1게임 |
+| random | 1게임 |
+| gap_based | 1게임 |
+
+게임 간 Jaccard 유사도 ≤ 0.5 다양성 후처리 포함.
+
 ### `model_score` — 모델 score 기반 전략
 
 LogisticRegression 모델이 산출한 score를 소프트맥스 가중치로 변환하여
@@ -409,7 +502,7 @@ python main.py backtest --strategy model_score --recent 100
 ## 테스트
 
 ```bash
-# 전체 테스트 (142개)
+# 전체 테스트 (223개)
 pytest
 
 # 커버리지 포함
@@ -435,6 +528,9 @@ pytest tests/test_features.py -k "Leakage" -v
 | `test_stats.py` | StatsAnalyzer |
 | `test_features.py` | FeatureBuilder + **leakage 방지 검증** |
 | `test_model_strategy.py` | ModelScoreStrategy, 제약 조건 |
+| `test_gap_strategy.py` | GapBasedStrategy (16개) |
+| `test_ensemble_strategy.py` | EnsembleStrategy, compute_diversity (22개) |
+| `test_balanced_v2_strategy.py` | BalancedV2Strategy, game_stats (43개) |
 | `test_backtest.py` | 백테스트 엔진, CSV 저장 |
 
 ---

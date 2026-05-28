@@ -57,6 +57,27 @@ class GapBasedStrategy(BaseStrategy):
         self._max_gap_ratio   = max_gap_ratio
         self._apply_constraints = apply_constraints
 
+    # ── 팩토리 (백테스트 경량 모드) ──────────────────────────────────────
+
+    @classmethod
+    def from_weights(
+        cls,
+        weights: np.ndarray,
+        seed: int | None = None,
+        apply_constraints: bool = True,
+    ) -> "GapBasedStrategy":
+        """사전 계산된 가중치를 직접 주입하는 팩토리.
+
+        모델 파일 I/O 없이 메모리 내 weights로 전략 인스턴스를 생성한다.
+        주로 백테스트 배치 사전 계산 결과를 주입하는 데 사용한다.
+        """
+        instance = cls.__new__(cls)
+        instance._preloaded_weights = weights.copy()
+        instance._rng               = random.Random(seed)
+        instance._np_rng            = np.random.default_rng(seed)
+        instance._apply_constraints = apply_constraints
+        return instance
+
     # ── 핵심 메서드 ───────────────────────────────────────────────────────
 
     def generate(
@@ -65,16 +86,19 @@ class GapBasedStrategy(BaseStrategy):
         history: pd.DataFrame | None = None,
     ) -> list[list[int]]:
         """gap 가중치로 n_games개의 게임을 생성한다."""
-        if history is None or len(history) == 0:
+        # 사전 계산 가중치 우선 사용 (백테스트 경량 모드)
+        if hasattr(self, "_preloaded_weights"):
+            weights = self._preloaded_weights
+        elif history is None or len(history) == 0:
             logger.warning("history 없음 — 순수 랜덤으로 대체")
             return [
                 sorted(self._rng.sample(range(LOTTO_MIN, LOTTO_MAX + 1), NUMBERS_PER_GAME))
                 for _ in range(n_games)
             ]
+        else:
+            weights = self._compute_weights(history)
 
-        weights = self._compute_weights(history)
         numbers = np.arange(LOTTO_MIN, LOTTO_MAX + 1)
-
         games: list[list[int]] = []
         for _ in range(n_games):
             if self._apply_constraints:
