@@ -43,12 +43,14 @@ VerboseOpt = Annotated[
     typer.Option("--verbose", "-v", help="디버그 로그 출력"),
 ]
 
-_DEFAULT_RESULTS  = Path(os.getenv("LOTTO_RESULTS_CSV",   "data/lotto_draw_results.csv"))
-_DEFAULT_GAMES    = Path(os.getenv("GENERATED_GAMES_CSV", "data/generated_games.csv"))
-_DEFAULT_FEATURES = Path("data/features.parquet")
-_DEFAULT_MODEL    = Path("data/models/lr_model.pkl")
-_DEFAULT_BACKTEST = Path("data/backtest_results.csv")
-_DEFAULT_STATS    = Path("data/number_stats.csv")
+_DEFAULT_RESULTS           = Path(os.getenv("LOTTO_RESULTS_CSV",   "data/lotto_draw_results.csv"))
+_DEFAULT_GAMES             = Path(os.getenv("GENERATED_GAMES_CSV", "data/generated_games.csv"))
+_DEFAULT_FEATURES          = Path("data/features.parquet")
+_DEFAULT_MODEL             = Path("data/models/lr_model.pkl")
+_DEFAULT_BACKTEST          = Path("data/backtest_results.csv")
+_DEFAULT_STATS             = Path("data/number_stats.csv")
+_DEFAULT_MULTISEED_RESULTS = Path("data/backtest_multiseed_results.csv")
+_DEFAULT_MULTISEED_SUMMARY = Path("data/backtest_multiseed_summary.csv")
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -233,5 +235,51 @@ def backtest(
         recent=recent,
         n_games=n_games,
         seed=seed,
+        save=not no_save,
+    )
+
+
+@app.command(name="backtest-multiseed")
+def backtest_multiseed(
+    strategy: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--strategy", "-s",
+            help="전략명 (random/balanced/balanced_v2/gap_based/model_score/ensemble, 반복 가능)",
+        ),
+    ] = None,
+    seeds: Annotated[
+        int,
+        typer.Option("--seeds", help="반복 실행할 시드 수 (seed 1~N)"),
+    ] = 10,
+    recent: Annotated[Optional[int], typer.Option("--recent",      help="최근 N회차 대상")] = None,
+    start:  Annotated[Optional[int], typer.Option("--start-round", help="시작 회차")] = None,
+    end:    Annotated[Optional[int], typer.Option("--end-round",   help="종료 회차")] = None,
+    n_games: Annotated[int, typer.Option("--n-games", "-n", help="회차당 생성 게임 수")] = 5,
+    no_save: Annotated[bool, typer.Option("--no-save", help="CSV 저장 건너뜀")] = False,
+    results: ResultsCsvOpt = _DEFAULT_RESULTS,
+    games:   GamesCsvOpt   = _DEFAULT_GAMES,
+    model:   ModelOpt      = _DEFAULT_MODEL,
+    verbose: VerboseOpt    = False,
+) -> None:
+    """📊 전략을 여러 시드로 반복 백테스트해 통계적 안정성을 평가한다.
+
+    seed 변동에 따른 성능 분포(평균±std)와 random baseline 대비 개선율을 출력한다.
+
+    예시:
+
+        python main.py backtest-multiseed -s random -s balanced --seeds 20 --recent 300
+        python main.py backtest-multiseed -s random -s balanced -s model_score -s ensemble --seeds 10 --recent 300
+        python main.py backtest-multiseed -s random -s balanced_v2 --seeds 30 --recent 200
+    """
+    _setup_logging(verbose)
+    strategies = strategy or ["random", "balanced"]
+    _make_agent(results, games, model=model).backtest_multiseed(
+        strategy_names=strategies,
+        n_seeds=seeds,
+        start_round=start,
+        end_round=end,
+        recent=recent,
+        n_games=n_games,
         save=not no_save,
     )

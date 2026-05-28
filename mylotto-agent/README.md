@@ -38,6 +38,7 @@ Python 기반 로또 번호 생성 & 학습 기반 번호 생성 실험 플랫�
 | **Gap 기반 전략 (GapBasedStrategy)** | ✅ |
 | **앙상블 전략 (EnsembleStrategy)** | ✅ |
 | **전략별 백테스트 (backtest)** | ✅ |
+| **멀티 시드 백테스트 (backtest-multiseed)** | ✅ |
 | `data/generated_games.csv` 저장 | ✅ |
 | Telegram Bot 알림 | 🔲 skeleton |
 | AWS S3 백업 | 🔲 skeleton |
@@ -97,6 +98,8 @@ mylotto-agent/
 │   ├── number_stats.csv             # 번호별 통계 (analyze 후 생성)
 │   ├── features.parquet             # ML feature 행렬 (build-features 후 생성)
 │   ├── backtest_results.csv         # 백테스트 결과 (backtest 후 생성)
+│   ├── backtest_multiseed_results.csv  # 멀티 시드 상세 결과 (backtest-multiseed 후 생성)
+│   ├── backtest_multiseed_summary.csv  # 멀티 시드 전략별 요약 (backtest-multiseed 후 생성)
 │   └── models/
 │       ├── lr_model.pkl             # 학습된 모델 (train-model 후 생성)
 │       └── lr_model.json            # 모델 메타데이터
@@ -152,6 +155,7 @@ mylotto-agent/
     ├── test_gap_strategy.py         # GapBasedStrategy 테스트
     ├── test_ensemble_strategy.py    # EnsembleStrategy + compute_diversity 테스트
     ├── test_balanced_v2_strategy.py # BalancedV2Strategy 테스트 (43개)
+    ├── test_backtest_multiseed.py   # 멀티 시드 백테스트 테스트 (25개)
     ├── test_strategy.py
     ├── test_storage.py
     └── test_validator.py
@@ -362,7 +366,89 @@ python main.py backtest --strategy random --n-games 10 --no-save
 
 5. **round_no → index 캐시**: `dict` 기반 O(1) 인덱스 조회로 `history[history["round_no"] == round_no]` 반복 제거.
 
-### 8. 올인원 실행
+### 8. 멀티 시드 백테스트
+
+단일 시드 결과의 통계적 노이즈를 제거하고, **seed를 바꿔가며 반복 실행한 평균·표준편차**로 전략의 안정성을 비교합니다.
+
+```bash
+# random + balanced 10 seeds × 최근 300회차 (기본)
+python main.py backtest-multiseed --seeds 10 --recent 300
+
+# 4개 전략 10 seeds 비교
+python main.py backtest-multiseed -s random -s balanced -s model_score -s ensemble \
+    --seeds 10 --recent 300
+
+# 30 seeds로 더 안정적인 통계 (약 2분 30초)
+python main.py backtest-multiseed -s random -s balanced -s balanced_v2 --seeds 30 --recent 300
+
+# 특정 회차 범위 지정
+python main.py backtest-multiseed -s random -s balanced \
+    --start-round 1000 --end-round 1200 --seeds 20
+
+# CSV 저장 없이 출력만
+python main.py backtest-multiseed -s random -s balanced --seeds 5 --recent 100 --no-save
+```
+
+#### 출력 예시 (10 seeds × 300회차)
+
+```text
+────── 📊 멀티 시드 백테스트 결과  10 seeds × 300회차 ──────
+                 최고일치       3개↑               4개↑
+  전략             평균±σ     평균±σ    3개↑%    평균±σ   cover%   다양성
+ ─────────────────────────────────────────────────────────────
+  random        1.74±0.03   35.0±6.1    11.7%   2.6±1.3    51.1%     71.8
+  balanced      1.72±0.04   34.0±5.0    11.3%   2.4±1.4    51.5%     71.6
+  model_score   1.72±0.04   34.5±5.1    11.5%   2.1±1.5    50.0%     70.9
+  ensemble      1.74±0.04   32.6±6.3    10.9%   2.7±1.4    52.0%     72.5
+
+  vs random (3개↑):  balanced -2.9%  |  model_score -1.4%  |  ensemble -6.9%
+  소요 시간: 43.3초  |  전략 4개 × 10 seeds
+✓ 멀티 시드 결과 저장: data/backtest_multiseed_results.csv (60,000행)
+✓ 멀티 시드 요약 저장: data/backtest_multiseed_summary.csv (4행)
+```
+
+#### 지표 설명
+
+| 지표 | 설명 |
+| --- | --- |
+| `최고일치 평균±σ` | seed별 (회차당 최고 일치 번호 수 평균)의 평균과 표준편차 |
+| `3개↑ 평균±σ` | seed별 3개 이상 일치 회차 수의 평균과 표준편차 |
+| `3개↑%` | 3개↑ 평균 ÷ 총 회차 × 100 (역사적 3등↑ 확률 기준 ≈ 1.4%) |
+| `4개↑ 평균±σ` | seed별 4개 이상 일치 회차 수의 평균과 표준편차 |
+| `cover%` | 생성된 게임들이 1~45 번호를 커버하는 비율 평균 |
+| `다양성` | 게임 간 Jaccard 기반 다양성 점수 평균 (0~100) |
+| `vs random (3개↑)` | random 대비 3개↑ 회차 수의 상대적 개선율 (+ 많음, - 적음) |
+
+#### 저장 CSV 포맷
+
+**`data/backtest_multiseed_results.csv`**: 기존 `backtest_results.csv`와 동일 포맷 + `seed` 컬럼 추가
+
+```text
+strategy, seed, round_no, game_no, n1, n2, n3, n4, n5, n6,
+winning_1...winning_6, bonus, match_count, best_match_in_round, coverage, diversity_score
+```
+
+**`data/backtest_multiseed_summary.csv`**: 전략별 집계 요약
+
+```text
+strategy, n_seeds, total_rounds,
+avg_best_match_mean, avg_best_match_std,
+match_3_plus_mean, match_3_plus_std,
+match_4_plus_mean, match_4_plus_std,
+coverage_mean, diversity_score_mean, vs_random_3plus_pct
+```
+
+#### 성능 (배치 사전계산 최적화 적용)
+
+| 구성 | 소요 시간 |
+| --- | --- |
+| 4전략 × 10 seeds × 300회차 × 5게임 | ~43초 |
+| 2전략 × 30 seeds × 300회차 × 5게임 | ~60초 |
+| model_score/ensemble 포함 시 | feature 배치 계산이 전략당 1회만 수행됨 |
+
+> 각 전략의 모델 score / gap 가중치는 seed 루프 **바깥**에서 1회 사전 계산하여 모든 seed가 공유합니다.
+
+### 9. 올인원 실행
 
 ```bash
 python main.py run
@@ -502,7 +588,7 @@ python main.py backtest --strategy model_score --recent 100
 ## 테스트
 
 ```bash
-# 전체 테스트 (223개)
+# 전체 테스트 (248개)
 pytest
 
 # 커버리지 포함
@@ -532,6 +618,7 @@ pytest tests/test_features.py -k "Leakage" -v
 | `test_ensemble_strategy.py` | EnsembleStrategy, compute_diversity (22개) |
 | `test_balanced_v2_strategy.py` | BalancedV2Strategy, game_stats (43개) |
 | `test_backtest.py` | 백테스트 엔진, CSV 저장 |
+| `test_backtest_multiseed.py` | MultiSeedResult, run_multiseed_backtest, 저장 함수 (25개) |
 
 ---
 

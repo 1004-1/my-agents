@@ -34,12 +34,14 @@ logger = logging.getLogger(__name__)
 console = Console()
 
 # 기본 경로
-DEFAULT_RESULTS_CSV   = Path("data/lotto_draw_results.csv")
-DEFAULT_GAMES_CSV     = Path("data/generated_games.csv")
-DEFAULT_STATS_CSV     = Path("data/number_stats.csv")
-DEFAULT_FEATURES_PQ   = Path("data/features.parquet")
-DEFAULT_MODEL_PATH    = Path("data/models/lr_model.pkl")
-DEFAULT_BACKTEST_CSV  = Path("data/backtest_results.csv")
+DEFAULT_RESULTS_CSV              = Path("data/lotto_draw_results.csv")
+DEFAULT_GAMES_CSV                = Path("data/generated_games.csv")
+DEFAULT_STATS_CSV                = Path("data/number_stats.csv")
+DEFAULT_FEATURES_PQ              = Path("data/features.parquet")
+DEFAULT_MODEL_PATH               = Path("data/models/lr_model.pkl")
+DEFAULT_BACKTEST_CSV             = Path("data/backtest_results.csv")
+DEFAULT_MULTISEED_RESULTS_CSV    = Path("data/backtest_multiseed_results.csv")
+DEFAULT_MULTISEED_SUMMARY_CSV    = Path("data/backtest_multiseed_summary.csv")
 
 
 # ── 내부 유틸 ──────────────────────────────────────────────────────────────
@@ -364,6 +366,75 @@ class LottoAgent:
                 save_backtest_results(result, self.backtest_csv)
 
         return results
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 9. 멀티 시드 백테스트
+    # ──────────────────────────────────────────────────────────────────────
+
+    def backtest_multiseed(
+        self,
+        strategy_names: list[str] | None = None,
+        start_round: int | None = None,
+        end_round: int | None = None,
+        recent: int | None = None,
+        n_games: int = 5,
+        n_seeds: int = 10,
+        save: bool = True,
+    ) -> "MultiSeedResult | None":
+        """전략을 여러 시드로 반복 백테스트하여 통계적 안정성을 평가한다.
+
+        Args:
+            strategy_names: 비교할 전략 목록 (기본: random, balanced)
+            start_round:    시작 회차 (None → min_history_rounds 이후)
+            end_round:      종료 회차 (None → 최신 회차)
+            recent:         최근 N회차를 시작 회차로 (start_round보다 우선)
+            n_games:        회차당 생성 게임 수
+            n_seeds:        반복 시드 수 (seed 1~n_seeds)
+            save:           결과 CSV 저장 여부
+
+        Returns:
+            MultiSeedResult (backtest 결과 없으면 None)
+        """
+        from .ml.backtest import (
+            MultiSeedResult,
+            run_multiseed_backtest,
+            save_multiseed_results,
+            save_multiseed_summary,
+        )
+
+        if strategy_names is None:
+            strategy_names = ["random", "balanced"]
+
+        history = self.storage.load_results()
+        if history.empty:
+            console.print("[red]당첨번호 데이터가 없습니다.[/red]")
+            return None
+
+        # --recent 처리
+        if recent is not None and start_round is None:
+            latest = int(history["round_no"].max())
+            start_round = latest - recent + 1
+
+        needs_model = any(
+            name in ("model_score", "ensemble") for name in strategy_names
+        )
+        model_path_arg = self.model_path if needs_model else None
+
+        result = run_multiseed_backtest(
+            history=history,
+            strategy_names=strategy_names,
+            n_seeds=n_seeds,
+            start_round=start_round,
+            end_round=end_round,
+            n_games=n_games,
+            model_path=model_path_arg,
+        )
+
+        if save:
+            save_multiseed_results(result, DEFAULT_MULTISEED_RESULTS_CSV)
+            save_multiseed_summary(result, DEFAULT_MULTISEED_SUMMARY_CSV)
+
+        return result
 
     # ──────────────────────────────────────────────────────────────────────
     # Private helpers

@@ -1,0 +1,5 @@
+﻿strategy,n_seeds,total_rounds,avg_best_match_mean,avg_best_match_std,match_3_plus_mean,match_3_plus_std,match_4_plus_mean,match_4_plus_std,coverage_mean,diversity_score_mean,vs_random_3plus_pct
+random,10,300,1.74,0.0299,35.0,6.09,2.6,1.26,0.5111,71.84,
+balanced,10,300,1.7197,0.0392,34.0,4.99,2.4,1.43,0.5152,71.6,-2.86
+model_score,10,300,1.7223,0.0437,34.5,5.06,2.1,1.52,0.5002,70.86,-1.43
+ensemble,10,300,1.743,0.0424,32.6,6.29,2.7,1.42,0.5202,72.5,-6.86
