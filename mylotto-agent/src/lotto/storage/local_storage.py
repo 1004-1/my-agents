@@ -1,6 +1,7 @@
 """로컬 CSV 파일 스토리지."""
 
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -9,7 +10,11 @@ logger = logging.getLogger(__name__)
 
 # CSV 컬럼 정의
 DRAW_COLUMNS = ["round_no", "date", "num1", "num2", "num3", "num4", "num5", "num6", "bonus"]
-GAME_COLUMNS = ["generated_at", "strategy", "game_no", "num1", "num2", "num3", "num4", "num5", "num6"]
+GAME_COLUMNS = [
+    "generated_at", "strategy", "game_no",
+    "num1", "num2", "num3", "num4", "num5", "num6",
+    "purchased", "purchased_at",
+]
 
 
 class LocalStorage:
@@ -73,7 +78,16 @@ class LocalStorage:
         """생성된 게임 CSV를 읽어 DataFrame으로 반환한다."""
         if not self.games_path.exists():
             return pd.DataFrame(columns=GAME_COLUMNS)
-        return pd.read_csv(self.games_path)
+        df = pd.read_csv(self.games_path, dtype={"purchased_at": object})
+        # 기존 CSV에 purchased 컬럼 없으면 추가 (하위 호환)
+        if "purchased" not in df.columns:
+            df["purchased"] = False
+        if "purchased_at" not in df.columns:
+            df["purchased_at"] = ""
+        # 빈 값으로 인해 float64로 추론된 경우 object로 강제 변환 (pandas 3.x 호환)
+        df["purchased_at"] = df["purchased_at"].fillna("").astype(object)
+        df["purchased"] = df["purchased"].fillna(False)
+        return df
 
     def save_games(self, df: pd.DataFrame) -> None:
         """생성된 게임 DataFrame을 CSV로 저장한다 (덮어쓰기)."""
@@ -86,6 +100,38 @@ class LocalStorage:
         merged = pd.concat([existing, df], ignore_index=True)
         self.save_games(merged)
         return merged
+
+    def mark_purchased_games(self, games: list[list[int]]) -> None:
+        """지정된 번호 조합을 구매 완료로 표시한다."""
+        df = self.load_games()
+        if df.empty:
+            return
+        ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        for game in games:
+            s = sorted(int(x) for x in game)
+            mask = (
+                (df["num1"].astype(int) == s[0]) &
+                (df["num2"].astype(int) == s[1]) &
+                (df["num3"].astype(int) == s[2]) &
+                (df["num4"].astype(int) == s[3]) &
+                (df["num5"].astype(int) == s[4]) &
+                (df["num6"].astype(int) == s[5])
+            )
+            df.loc[mask, "purchased"]    = True
+            df.loc[mask, "purchased_at"] = ts
+        self.save_games(df)
+        logger.info("구매 완료 표시: %d게임", len(games))
+
+    def get_purchased_combos(self) -> set[frozenset[int]]:
+        """구매 완료된 번호 조합 집합을 반환한다."""
+        df = self.load_games()
+        if df.empty or "purchased" not in df.columns:
+            return set()
+        purchased = df[df["purchased"] == True]
+        return {
+            frozenset(int(row[f"num{i}"]) for i in range(1, 7))
+            for _, row in purchased.iterrows()
+        }
 
     # ──────────────────────────────────────────────────────────────────────
     # Private helpers

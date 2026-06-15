@@ -13,6 +13,8 @@ from rich.console import Console
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 app = typer.Typer(
     name="lotto",
     help="🎱 로또 번호 생성 & 당첨번호 수집 Agent",
@@ -295,6 +297,102 @@ def backtest(
         seed=seed,
         save=not no_save,
     )
+
+
+@app.command(name="buy-lotto")
+def buy_lotto(
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="브라우저를 열지 않고 입력할 번호만 미리 출력"),
+    ] = False,
+    max_games: Annotated[
+        int,
+        typer.Option("--max-games", help="최대 구매 게임 수 (1~5, 기본 5)"),
+    ] = 5,
+    games:   GamesCsvOpt   = _DEFAULT_GAMES,
+    verbose: VerboseOpt    = False,
+) -> None:
+    """🛒 생성된 번호를 동행복권 사이트에 자동 입력한다 (구매 버튼은 클릭 안 함).
+
+    generated_games.csv의 최신 번호를 읽어 Chromium 브라우저를 열고,
+    사용자가 로그인하면 번호를 자동으로 입력한 뒤 구매 버튼 직전에서 대기한다.
+
+    세션은 data/browser-profile 에 저장되므로 이후 실행 시 재로그인이 불필요하다.
+    스크린샷은 screenshots/ 폴더에 자동 저장된다.
+
+    예시:
+
+        python main.py buy-lotto
+        python main.py buy-lotto --dry-run
+        python main.py buy-lotto --max-games 3
+    """
+    import asyncio
+    from rich import box as rich_box
+    from rich.table import Table
+
+    _setup_logging(verbose)
+
+    from .automation.playwright_buyer import LottoBuyer
+
+    headless = os.getenv("HEADLESS", "false").lower() in ("true", "1", "yes")
+    buyer = LottoBuyer(
+        games_csv=games,
+        max_games=max_games,
+        headless=headless,
+    )
+
+    # ── 최신 게임 로드 ────────────────────────────────────────────────────
+    try:
+        loaded_games = buyer.load_latest_games()
+    except (FileNotFoundError, ValueError) as exc:
+        console.print(f"[red]✗ {exc}[/red]")
+        raise typer.Exit(1)
+
+    # ── 번호 미리 출력 ────────────────────────────────────────────────────
+    console.rule("[bold cyan]🛒 구매 번호 확인[/bold cyan]")
+    tbl = Table(
+        show_header=True,
+        header_style="bold blue",
+        box=rich_box.SIMPLE_HEAD,
+        padding=(0, 1),
+    )
+    tbl.add_column("게임", style="dim", width=5)
+    for i in range(1, 7):
+        tbl.add_column(f"번호{i}", justify="right", min_width=5)
+    for idx, nums in enumerate(loaded_games, 1):
+        tbl.add_row(str(idx), *[str(n) for n in nums])
+    console.print(tbl)
+    console.print(f"  [dim]총 {len(loaded_games)}게임  |  소스: {games}[/dim]\n")
+
+    if dry_run:
+        console.print("[yellow]--dry-run 모드: 브라우저를 열지 않습니다.[/yellow]")
+        return
+
+    # ── 브라우저 자동화 실행 ──────────────────────────────────────────────
+    async def _run() -> None:
+        try:
+            await buyer.open_browser()
+            screenshot, purchased = await buyer.run(loaded_games)
+            if purchased:
+                console.print(
+                    f"\n[bold green]✓ 구매 완료!  {len(loaded_games)}게임[/bold green]\n"
+                    f"  스크린샷: [dim]{screenshot}[/dim]\n"
+                )
+            else:
+                console.print(
+                    f"\n[bold yellow]⚠ 자동 구매 실패 — 브라우저에서 직접 확인하세요.[/bold yellow]\n"
+                    f"  스크린샷: [dim]{screenshot}[/dim]\n"
+                )
+            await buyer.close()
+        except TimeoutError as exc:
+            console.print(f"[red]✗ {exc}[/red]")
+            await buyer.close()
+        except Exception as exc:
+            console.print(f"[red]✗ 자동화 오류: {exc}[/red]")
+            logger.exception("buy-lotto 오류")
+            await buyer.close()
+
+    asyncio.run(_run())
 
 
 @app.command(name="backtest-multiseed")
