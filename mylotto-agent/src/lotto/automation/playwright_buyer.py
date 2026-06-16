@@ -139,7 +139,10 @@ class LottoBuyer:
     # ──────────────────────────────────────────────────────────────────────
 
     def load_latest_games(self) -> list[list[int]]:
-        """generated_games.csv에서 가장 최근 생성 배치의 게임을 읽는다.
+        """generated_games.csv에서 가장 최근 생성 배치의 미구매 게임을 읽는다.
+
+        - 이미 purchased=True 인 게임은 제외한다.
+        - 최신 배치가 모두 구매됐으면 ValueError를 발생시킨다.
 
         Returns:
             [[n1, n2, n3, n4, n5, n6], ...]  오름차순 정렬, 최대 max_games 개
@@ -149,15 +152,30 @@ class LottoBuyer:
                 f"게임 파일이 없습니다: {self.games_csv}\n"
                 "  먼저 `python main.py run` 을 실행하세요."
             )
-        df = pd.read_csv(self.games_csv)
+
+        from ..storage.local_storage import LocalStorage
+        storage = LocalStorage(
+            results_path=self.games_csv.parent / "lotto_draw_results.csv",
+            games_path=self.games_csv,
+        )
+        df = storage.load_games()  # dtype 보정 포함
         if df.empty:
             raise ValueError("게임 파일이 비어 있습니다.")
 
         latest_ts = df["generated_at"].max()
-        latest_df = df[df["generated_at"] == latest_ts].head(self.max_games)
+        latest_df = df[df["generated_at"] == latest_ts]
+
+        # 이미 구매 완료된 게임 제외
+        unpurchased = latest_df[~latest_df["purchased"].astype(bool)]
+        if unpurchased.empty:
+            date_str = str(latest_ts)[:16]
+            raise ValueError(
+                f"최신 배치({date_str})의 모든 게임이 이미 구매됐습니다.\n"
+                "  `python main.py run` 으로 새 번호를 생성하세요."
+            )
 
         games: list[list[int]] = []
-        for _, row in latest_df.iterrows():
+        for _, row in unpurchased.head(self.max_games).iterrows():
             nums = sorted(int(row[f"num{i}"]) for i in range(1, 7))
             games.append(nums)
         return games

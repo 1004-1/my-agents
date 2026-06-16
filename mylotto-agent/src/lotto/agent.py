@@ -222,6 +222,11 @@ class LottoAgent:
         history      = self.storage.load_results()
         generated_at = datetime.now(tz=timezone.utc).isoformat()
 
+        # 이전 구매 번호 로드 (재사용 방지)
+        purchased_combos = self.storage.get_purchased_combos()
+        if purchased_combos:
+            console.print(f"  [dim]이전 구매 번호 {len(purchased_combos)}조합 제외 예정[/dim]")
+
         # ── 헤더 출력 ──────────────────────────────────────────────────────
         label_parts = [f"{name} {n}게임" for name, n in strategy_games.items()]
         total_n = sum(strategy_games.values())
@@ -235,8 +240,12 @@ class LottoAgent:
         for strategy_name, n in strategy_games.items():
             strategy = self._build_strategy(strategy_name, seed, model_path=self.model_path)
 
-            # 게임 생성
+            # 게임 생성 (구매 이력과 중복되면 재생성)
             games = strategy.generate(n_games=n, history=history)
+            if purchased_combos:
+                games = self._exclude_purchased(
+                    games, purchased_combos, strategy, history, target_n=n
+                )
 
             # 전략 간 중복·과도한 겹침 제거
             if cross_dedup and all_sets:
@@ -261,6 +270,8 @@ class LottoAgent:
                     "game_no":      game_no,
                     "num1": numbers[0], "num2": numbers[1], "num3": numbers[2],
                     "num4": numbers[3], "num5": numbers[4], "num6": numbers[5],
+                    "purchased":    False,
+                    "purchased_at": "",
                 })
 
         # ── 전략 간 종합 요약 ──────────────────────────────────────────────
@@ -553,6 +564,47 @@ class LottoAgent:
             f"알 수 없는 전략: {name!r}. "
             "사용 가능: random, balanced, balanced_v2, gap_based, model_score, ensemble"
         )
+
+    @staticmethod
+    def _exclude_purchased(
+        games: list[list[int]],
+        purchased: set[frozenset[int]],
+        strategy,
+        history: pd.DataFrame,
+        target_n: int,
+        max_attempts: int = 50,
+    ) -> list[list[int]]:
+        """구매 이력과 완전히 동일한 게임을 재생성하여 교체한다."""
+        result: list[list[int]] = []
+        used = set(purchased)  # 이번 배치 내 중복도 방지
+
+        for game in games:
+            if frozenset(game) not in used:
+                result.append(game)
+                used.add(frozenset(game))
+            else:
+                # 구매 이력 충돌 → 재생성
+                replaced = False
+                for _ in range(max_attempts):
+                    new_games = strategy.generate(n_games=1, history=history)
+                    if new_games and frozenset(new_games[0]) not in used:
+                        result.append(new_games[0])
+                        used.add(frozenset(new_games[0]))
+                        replaced = True
+                        break
+                if not replaced:
+                    result.append(game)  # 대체 실패 → 원본 유지
+
+        # target_n 보다 부족한 경우 채우기
+        attempts = 0
+        while len(result) < target_n and attempts < max_attempts:
+            new_games = strategy.generate(n_games=1, history=history)
+            if new_games and frozenset(new_games[0]) not in used:
+                result.append(new_games[0])
+                used.add(frozenset(new_games[0]))
+            attempts += 1
+
+        return result[:target_n]
 
     @staticmethod
     def _cross_dedup_games(
