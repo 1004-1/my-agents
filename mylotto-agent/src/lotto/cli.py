@@ -53,6 +53,7 @@ _DEFAULT_BACKTEST          = Path("data/backtest_results.csv")
 _DEFAULT_STATS             = Path("data/number_stats.csv")
 _DEFAULT_MULTISEED_RESULTS = Path("data/backtest_multiseed_results.csv")
 _DEFAULT_MULTISEED_SUMMARY = Path("data/backtest_multiseed_summary.csv")
+_DEFAULT_PREDICTION        = Path("data/prediction_results.csv")
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -371,26 +372,28 @@ def buy_lotto(
     # ── 브라우저 자동화 실행 ──────────────────────────────────────────────
     async def _run() -> None:
         try:
-            await buyer.open_browser()
-            screenshot, purchased = await buyer.run(loaded_games)
-            if purchased:
+            screenshot, purchased_count = await buyer.run(loaded_games)
+            total = len(loaded_games)
+            if purchased_count == total:
                 console.print(
-                    f"\n[bold green]✓ 구매 완료!  {len(loaded_games)}게임[/bold green]\n"
+                    f"\n[bold green]✓ 구매 완료!  {purchased_count}/{total}게임[/bold green]\n"
+                    f"  스크린샷: [dim]{screenshot}[/dim]\n"
+                )
+            elif purchased_count > 0:
+                console.print(
+                    f"\n[bold yellow]⚠ 부분 구매: {purchased_count}/{total}게임 완료[/bold yellow]\n"
                     f"  스크린샷: [dim]{screenshot}[/dim]\n"
                 )
             else:
                 console.print(
-                    f"\n[bold yellow]⚠ 자동 구매 실패 — 브라우저에서 직접 확인하세요.[/bold yellow]\n"
+                    f"\n[bold red]✗ 구매 실패 — 브라우저에서 직접 확인하세요.[/bold red]\n"
                     f"  스크린샷: [dim]{screenshot}[/dim]\n"
                 )
-            await buyer.close()
         except TimeoutError as exc:
             console.print(f"[red]✗ {exc}[/red]")
-            await buyer.close()
         except Exception as exc:
             console.print(f"[red]✗ 자동화 오류: {exc}[/red]")
             logger.exception("buy-lotto 오류")
-            await buyer.close()
 
     asyncio.run(_run())
 
@@ -439,3 +442,162 @@ def backtest_multiseed(
         n_games=n_games,
         save=not no_save,
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# check-results  /  strategy-report  — 피드백 루프
+# ══════════════════════════════════════════════════════════════════════════
+
+PredictionCsvOpt = Annotated[
+    Path,
+    typer.Option("--prediction", help="적중 결과 CSV 경로"),
+]
+
+
+@app.command(name="check-results")
+def check_results(
+    results:    ResultsCsvOpt    = _DEFAULT_RESULTS,
+    games:      GamesCsvOpt      = _DEFAULT_GAMES,
+    prediction: PredictionCsvOpt = _DEFAULT_PREDICTION,
+    verbose:    VerboseOpt       = False,
+) -> None:
+    """🔍 생성된 번호와 실제 당첨번호를 비교해 적중 결과를 기록한다.
+
+    생성 날짜 이후 최초 추첨 회차와 비교하며, 아직 추첨이 없는 게임은 건너뜁니다.
+
+    결과는 [b]data/prediction_results.csv[/b]에 누적 저장됩니다.
+
+    예시:
+
+        python main.py check-results
+        python main.py check-results --games data/generated_games.csv
+    """
+    from rich.table import Table
+
+    _setup_logging(verbose)
+
+    from .analysis.result_checker import ResultChecker
+
+    checker = ResultChecker(
+        games_path=games,
+        results_path=results,
+        prediction_path=prediction,
+    )
+
+    console.print("\n[bold cyan]═══ 적중 결과 확인 ═══[/bold cyan]")
+    df, added, skipped = checker.check_all()
+
+    if added == 0 and skipped == 0 and df.empty:
+        console.print("  [yellow]생성된 게임 데이터가 없습니다.[/yellow]")
+        return
+
+    console.print(
+        f"  신규 체크: [green]{added}[/green]건  "
+        f"미추첨 스킵: [yellow]{skipped}[/yellow]건  "
+        f"누적 총계: [cyan]{len(df)}[/cyan]건"
+    )
+
+    if df.empty:
+        return
+
+    import pandas as _pd
+    df["match_count"] = _pd.to_numeric(df["match_count"], errors="coerce").fillna(0).astype(int)
+
+    # 최근 20건 테이블 출력
+    recent = df.tail(20).copy()
+    table = Table(title="최근 결과 (최대 20건)", show_lines=False)
+    table.add_column("생성일",    style="dim",     width=12)
+    table.add_column("회차",      justify="right", width=6)
+    table.add_column("전략",      width=16)
+    table.add_column("내번호",    width=20)
+    table.add_column("당첨번호",  width=20)
+    table.add_column("적중",      justify="center", width=4)
+    table.add_column("등수",      justify="center", width=5)
+
+    for _, r in recent.iterrows():
+        rank_val = str(r["rank"]) if str(r["rank"]) not in ("", "nan") else "-"
+        rank_style = {
+            "1": "bold magenta", "2": "bold red", "3": "bold yellow",
+            "4": "yellow", "5": "green",
+        }.get(rank_val, "dim")
+        mc = int(r["match_count"])
+        mc_style = "green" if mc >= 3 else "dim"
+        table.add_row(
+            str(r["generated_at"])[:10],
+            str(r["target_round_no"]),
+            str(r["strategy_name"]),
+            str(r["numbers"]),
+            str(r["winning_numbers"]),
+            f"[{mc_style}]{mc}[/{mc_style}]",
+            f"[{rank_style}]{rank_val}[/{rank_style}]",
+        )
+
+    console.print(table)
+    console.print(f"\n  [dim]저장 위치: {prediction}[/dim]\n")
+
+
+@app.command(name="strategy-report")
+def strategy_report(
+    prediction: PredictionCsvOpt = _DEFAULT_PREDICTION,
+    verbose:    VerboseOpt       = False,
+) -> None:
+    """📈 전략별 실제 적중 성과를 통계로 요약한다.
+
+    [b]check-results[/b] 실행 후 쌓인 [b]data/prediction_results.csv[/b]를 기반으로
+    전략별 평균 적중 수, 등수 분포 등을 표로 출력합니다.
+
+    예시:
+
+        python main.py strategy-report
+        python main.py strategy-report --prediction data/prediction_results.csv
+    """
+    from rich.table import Table
+
+    _setup_logging(verbose)
+
+    from .analysis.result_checker import ResultChecker
+
+    checker = ResultChecker(prediction_path=prediction)
+
+    console.print("\n[bold cyan]═══ 전략별 성과 리포트 ═══[/bold cyan]")
+    summary = checker.strategy_summary()
+
+    if summary.empty:
+        console.print(
+            f"  [yellow]데이터가 없습니다. 먼저 [bold]check-results[/bold]를 실행하세요.[/yellow]\n"
+        )
+        return
+
+    table = Table(title="전략별 실적 (prediction_results.csv 기준)", show_lines=True)
+    table.add_column("전략",         width=18)
+    table.add_column("총게임",        justify="right", width=7)
+    table.add_column("평균적중",      justify="right", width=8)
+    table.add_column("3+",           justify="right", width=5)
+    table.add_column("4+",           justify="right", width=5)
+    table.add_column("5+",           justify="right", width=5)
+    table.add_column("최대",          justify="right", width=5)
+    table.add_column("5등",           justify="right", width=5)
+    table.add_column("4등",           justify="right", width=5)
+    table.add_column("3등",           justify="right", width=5)
+    table.add_column("2등",           justify="right", width=5)
+    table.add_column("1등",           justify="right", width=5)
+
+    for _, r in summary.iterrows():
+        avg_str = f"{r['avg_match']:.3f}"
+        table.add_row(
+            str(r["strategy"]),
+            str(r["total_games"]),
+            avg_str,
+            str(r["match_3plus"]),
+            str(r["match_4plus"]),
+            str(r["match_5plus"]),
+            str(r["max_match"]),
+            str(r["rank_5"]),
+            str(r["rank_4"]),
+            str(r["rank_3"]),
+            str(r["rank_2"]),
+            str(r["rank_1"]),
+        )
+
+    console.print(table)
+    console.print()

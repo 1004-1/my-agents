@@ -255,69 +255,19 @@ class LottoBuyer:
         await self.login(timeout_seconds)
 
     async def navigate_to_buy_page(self) -> None:
-        """팝업 닫기 → 추첨식복권 바로구매 클릭 → 구매 페이지 이동."""
+        """팝업 닫기 → 구매 페이지 직접 이동."""
         page = self._page
 
         await page.wait_for_load_state("domcontentloaded")
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(1000)
 
-        # 로그인 직후 화면 캡처 (팝업 구조 확인용)
-        dbg2 = self.screenshot_dir / "debug_after_login.png"
-        await page.screenshot(path=str(dbg2))
-        console.print(f"  [dim]로그인 후 캡처: {dbg2}[/dim]")
-
-        # 팝업 HTML 구조 출력
-        popup_info = await page.evaluate("""
-            () => {
-                const candidates = Array.from(document.querySelectorAll(
-                    '[class*=popup],[class*=modal],[class*=layer],[class*=dim]'
-                )).filter(el => el.offsetParent !== null)
-                  .map(el => ({tag: el.tagName, id: el.id, cls: el.className.slice(0,80)}));
-                return candidates.slice(0, 10);
-            }
-        """)
-        console.print(f"  [dim]팝업 후보: {popup_info}[/dim]")
-
-        # 팝업 닫기 (최대 3개)
+        # 팝업이 있으면 닫기
         await self._close_popups()
 
-        # "바로구매" 버튼 클릭 — "추첨식복권" 영역 우선, 전체 페이지 폴백
-        _BUY_NOW_SELECTORS = [
-            "a:text('바로구매')",
-            "button:text('바로구매')",
-            "a:has-text('바로구매')",
-        ]
-        clicked = False
-        for sel in _BUY_NOW_SELECTORS:
-            try:
-                # 추첨식복권 섹션 내 바로구매 우선
-                in_section = page.locator(f"*:has-text('추첨식복권') {sel}")
-                if await in_section.count() > 0:
-                    await in_section.first.click()
-                    console.print("  [dim]추첨식복권 > 바로구매 클릭[/dim]")
-                    clicked = True
-                    break
-                # 전체 페이지 폴백
-                el = page.locator(sel)
-                if await el.count() > 0:
-                    await el.first.click()
-                    console.print(f"  [dim]바로구매 클릭 ({sel})[/dim]")
-                    clicked = True
-                    break
-            except Exception as e:
-                logger.debug("바로구매 sel %s 실패: %s", sel, e)
-
-        if not clicked:
-            console.print("  [yellow]'바로구매' 버튼 미발견 → 직접 URL 이동[/yellow]")
-            await page.goto(_BUY_URL, wait_until="domcontentloaded")
-
-        await page.wait_for_load_state("domcontentloaded")
-        await page.wait_for_timeout(2500)
-
-        # 구매 페이지 캡처
-        dbg_buy = self.screenshot_dir / "debug_buy_page.png"
-        await page.screenshot(path=str(dbg_buy))
-        console.print(f"  [dim]구매 페이지 캡처: {dbg_buy}[/dim]")
+        # 구매 페이지로 직접 이동
+        console.print(f"  [dim]구매 페이지 이동: {_BUY_URL}[/dim]")
+        await page.goto(_BUY_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
 
         # 번호 피커가 들어 있는 iframe 프레임 감지 (없으면 메인 페이지 사용)
         self._game_frame = await self._find_game_frame()
@@ -460,6 +410,10 @@ class LottoBuyer:
             console.print("[red]✗ 구매하기 버튼 비활성화 — 카트가 비어 있습니다[/red]")
             return False
 
+        # 구매하기 클릭 전 확인버튼 위치 스냅샷 (기존 버튼과 팝업 버튼 구분용)
+        before_positions = await self._snapshot_confirm_positions()
+        console.print(f"  [dim]클릭 전 확인버튼 {len(before_positions)}개 감지[/dim]")
+
         # ── 네이티브 dialog 핸들러 등록 ──────────────────────────────────────
         # Playwright 기본값: confirm() → false (취소). accept()로 재정의해야 구매 진행.
         _dialog_accepted: list[str] = []
@@ -482,9 +436,9 @@ class LottoBuyer:
 
             confirmed_via_dialog = bool(_dialog_accepted)
 
-            # DOM 기반 팝업 처리 (네이티브 dialog가 없었던 경우)
+            # DOM 기반 팝업 처리 — 클릭 전 스냅샷과 비교해 신규 버튼만 클릭
             if not confirmed_via_dialog:
-                confirmed_via_dom = await self._handle_purchase_popup()
+                confirmed_via_dom = await self._handle_purchase_popup(before_positions)
             else:
                 confirmed_via_dom = False
 
@@ -493,7 +447,7 @@ class LottoBuyer:
             # 구매 완료 후 캡처
             await self.save_screenshot("after_purchase")
 
-            # 성공 판정: dialog 처리 OR DOM 팝업 처리 OR 페이지 성공 감지
+            # 성공 판정
             success_on_page = await self._detect_purchase_success()
             if success_on_page:
                 console.print("[green]✓ 구매 완료 확인 (페이지 메시지 감지)[/green]")
@@ -513,65 +467,66 @@ class LottoBuyer:
         finally:
             page.remove_listener("dialog", _on_dialog)
 
-    async def _handle_purchase_popup(self) -> bool:
-        """DOM 기반 구매 확인 팝업의 '확인' 버튼을 클릭한다.
+    async def _snapshot_confirm_positions(self) -> set[tuple[int, int]]:
+        """현재 화면에 보이는 input[value='확인'] 위치를 스냅샷으로 반환한다."""
+        try:
+            positions = await self._page.evaluate("""() =>
+                Array.from(document.querySelectorAll('input[value="확인"]'))
+                    .filter(el => el.offsetParent !== null)
+                    .map(el => {
+                        const r = el.getBoundingClientRect();
+                        return [Math.round(r.left), Math.round(r.top)];
+                    })
+            """)
+            return {tuple(p) for p in (positions or [])}
+        except Exception:
+            return set()
 
-        '구매하시겠습니까?' 텍스트를 기준으로 JS로 직접 탐색한다.
-        (사이트가 .ui-dialog 등 표준 클래스를 쓰지 않으므로 CSS 셀렉터 방식은 신뢰 불가)
+    async def _handle_purchase_popup(self, before_positions: set | None = None) -> bool:
+        """구매 확인 팝업의 '확인' 버튼을 클릭한다.
+
+        구매하기 클릭 전 스냅샷(before_positions)과 비교해
+        새로 나타난 input[value='확인'] 의 DOM 인덱스를 찾은 뒤
+        Playwright locator.click(force=True) 로 요소를 직접 클릭한다.
         """
         page  = self._page
         frame = self._game_frame or self._page
+        if before_positions is None:
+            before_positions = set()
 
-        # ── 방법 1: JS — "구매하시겠습니까" 텍스트 기준으로 확인 버튼 찾기 ──
-        for ctx_name, ctx in [("frame", frame), ("page", page)]:
-            try:
-                result = await ctx.evaluate("""() => {
-                    const keyword = '구매하시겠습니까';
-                    // "구매하시겠습니까" 를 포함하면서 button 자식을 가진 DOM 요소 중 가장 작은 것
-                    const candidates = Array.from(document.querySelectorAll('*'))
-                        .filter(el =>
-                            el.textContent.includes(keyword) &&
-                            el.querySelectorAll('button').length >= 1
-                        )
-                        .sort((a, b) => a.textContent.length - b.textContent.length);
-                    if (!candidates.length) return 'no_popup';
-                    const popup = candidates[0];
-                    const confirmBtn = Array.from(popup.querySelectorAll('button'))
-                        .find(b => (b.textContent.trim() === '확인' || b.innerText.trim() === '확인'));
-                    if (confirmBtn) {
-                        confirmBtn.click();
-                        return 'clicked:' + popup.className;
-                    }
-                    return 'no_button';
-                }""")
-                console.print(f"  [dim]JS 팝업 탐색 ({ctx_name}): {result}[/dim]")
-                if isinstance(result, str) and result.startswith("clicked"):
-                    return True
-            except Exception as e:
-                console.print(f"  [dim]JS 팝업 탐색 오류 ({ctx_name}): {e}[/dim]")
+        # 팝업이 완전히 렌더링될 시간을 준다
+        await page.wait_for_timeout(1500)
 
-        # ── 방법 2: Playwright 셀렉터 (클래스 무관, 텍스트 기반) ──────────────
-        broad_sels = [
-            "button:text-is('확인')",
-            "input[value='확인']",
-            "button:text-is('예')",
-        ]
-        for ctx_name, ctx in [("frame", frame), ("page", page)]:
-            for sel in broad_sels:
-                try:
-                    els = ctx.locator(sel)
-                    cnt = await els.count()
-                    # 여러 "확인" 버튼 중 마지막(팝업 버튼이 DOM 후위에 있을 가능성)
-                    for i in range(cnt - 1, -1, -1):
-                        el = els.nth(i)
-                        if await el.is_visible(timeout=500):
-                            await el.click()
-                            console.print(f"  [dim]팝업 버튼 클릭 ({ctx_name}: {sel} #{i})[/dim]")
-                            return True
-                except Exception:
-                    continue
+        # 새로 나타난 input[value='확인'] 의 전체 NodeList 인덱스를 구한다
+        idx = await page.evaluate("""(beforeArr) => {
+            const before = new Set(beforeArr.map(([x, y]) => x + ',' + y));
+            const all = Array.from(document.querySelectorAll('input[value="확인"]'));
+            for (let i = 0; i < all.length; i++) {
+                const el = all[i];
+                if (el.offsetParent === null) continue;   // 숨김 요소 제외
+                const r   = el.getBoundingClientRect();
+                const key = Math.round(r.left) + ',' + Math.round(r.top);
+                if (!before.has(key)) return i;
+            }
+            return -1;
+        }""", [list(p) for p in before_positions])
 
-        console.print("  [dim]구매 확인 팝업 처리 실패[/dim]")
+        if idx >= 0:
+            console.print(f"  [dim]신규 확인버튼 감지 (DOM index={idx}) — locator 클릭[/dim]")
+            btn = frame.locator('input[value="확인"]').nth(idx)
+            await btn.scroll_into_view_if_needed()
+            await btn.click(force=True)
+            await page.wait_for_timeout(500)
+
+            # 팝업이 닫혔는지 확인 (버튼 수가 줄었으면 팝업 처리 성공)
+            after_cnt = await page.evaluate("""() =>
+                Array.from(document.querySelectorAll('input[value="확인"]'))
+                    .filter(el => el.offsetParent !== null).length
+            """)
+            console.print(f"  [dim]클릭 후 확인버튼 수: before={len(before_positions)+1} → after={after_cnt}[/dim]")
+            return True
+
+        console.print("  [dim]신규 확인버튼 미감지 — 구매 팝업 미출현[/dim]")
         return False
 
     async def _detect_purchase_success(self) -> bool:
@@ -609,25 +564,52 @@ class LottoBuyer:
         storage.mark_purchased_games(games)
         console.print(f"  [green]✓ {len(games)}게임 구매 기록 저장[/green]")
 
-    async def run(self, games: list[list[int]]) -> tuple[Path, bool]:
-        """로그인 → 구매 페이지 이동 → 번호 입력 → 구매 → 스크린샷 순서로 실행한다.
+    async def run(self, games: list[list[int]]) -> tuple[Path, int]:
+        """게임별로 브라우저를 열고 닫으며 1회씩 반복 구매한다.
 
-        open_browser() 호출 이후에 실행한다.
+        각 게임마다 브라우저를 새로 시작 → 로그인 → 구매 → 종료 순으로 진행한다.
 
         Returns:
-            (screenshot_path, purchase_success)
+            (마지막_screenshot_path, 구매_성공_게임_수)
         """
-        await self.login()
-        await self.navigate_to_buy_page()
-        added = await self.fill_numbers(games)
-        if added == 0:
-            console.print("[red]✗ 카트에 추가된 게임 없음 — 구매 중단[/red]")
-            return await self.save_screenshot("cart_empty"), False
-        purchased = await self.purchase_games()
-        if purchased:
-            self.mark_purchased(games)
-        label = "purchase_complete" if purchased else "numbers_filled"
-        return await self.save_screenshot(label), purchased
+        import asyncio
+
+        purchased_count = 0
+        last_screenshot: Path = self.screenshot_dir / "start.png"
+
+        for idx, game in enumerate(games, 1):
+            console.print(f"\n[bold cyan]━━ 게임 {idx}/{len(games)}: {game} ━━[/bold cyan]")
+
+            await self.open_browser()
+            try:
+                await self.login()
+                await self.navigate_to_buy_page()
+                added = await self.fill_numbers([game])
+
+                if added == 0:
+                    console.print(f"  [red]✗ 카트 추가 실패 — 게임 {idx} 건너뜀[/red]")
+                    last_screenshot = await self.save_screenshot(f"game{idx}_cart_fail")
+                    continue
+
+                ok = await self.purchase_games()
+                if ok:
+                    self.mark_purchased([game])
+                    purchased_count += 1
+                    console.print(f"  [green]✓ 게임 {idx} 구매 완료 ({purchased_count}/{len(games)})[/green]")
+                else:
+                    console.print(f"  [yellow]⚠ 게임 {idx} 구매 실패[/yellow]")
+
+                last_screenshot = await self.save_screenshot(
+                    f"game{idx}_{'ok' if ok else 'fail'}"
+                )
+            finally:
+                await self.close()
+
+            if idx < len(games):
+                console.print(f"  [dim]다음 게임까지 2초 대기...[/dim]")
+                await asyncio.sleep(2)
+
+        return last_screenshot, purchased_count
 
     async def close(self) -> None:
         """브라우저와 Playwright 인스턴스를 닫는다."""
@@ -635,6 +617,10 @@ class LottoBuyer:
             await self._context.close()
         if self._pw:
             await self._pw.stop()
+        self._pw = None
+        self._context = None
+        self._page = None
+        self._game_frame = None
 
     # ──────────────────────────────────────────────────────────────────────
     # Private helpers

@@ -98,9 +98,9 @@ if ($LASTEXITCODE -ne 0) { Die "game generation failed" }
 Log "game generation done (5 games)"
 
 # ─────────────────────────────────────────────────────────────
-# Step 5: Auto-purchase (5 games)
+# Step 5: Auto-purchase (1 game at a time, 5 rounds)
 # ─────────────────────────────────────────────────────────────
-Step 5 5 "Auto-purchase (5 games)"
+Step 5 5 "Auto-purchase (1 game x 5 rounds)"
 & $PythonExe main.py buy-lotto --max-games 5
 Log "buy-lotto done"
 
