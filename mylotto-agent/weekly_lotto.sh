@@ -1,25 +1,24 @@
 #!/bin/bash
 # weekly_lotto.sh
-# Weekly pipeline: collect -> analyze -> train -> generate -> buy
+# Weekly pipeline: collect -> analyze -> train -> generate -> buy -> check-results
 #
 # Pipeline:
-#   [1] collect   (inside run)   fetch latest draw results
-#   [2] analyze                  update number statistics
-#   [3] build-features           build ML feature matrix
-#   [4] train-model              retrain model
-#   [5] run                      generate games (purchased combos excluded)
-#   [6] buy-lotto                auto-fill + purchase
+#   [1] analyze          update number statistics  (collect is inside 'run')
+#   [2] build-features   build ML feature matrix
+#   [3] train-model      retrain model
+#   [4] run              collect + generate games (purchased combos excluded)
+#   [5] buy-lotto        auto-purchase (1 game x 5 rounds)
+#   [6] check-results    compare vs actual draw results (accumulated feedback)
 #
-# Setup:
-#   chmod +x weekly_lotto.sh
-#   pip install playwright && playwright install chromium
-#   playwright install-deps chromium      # install system dependencies
+# ── Amazon Linux 2023 최초 설정 ─────────────────────────────────
+#   bash scripts/setup_amazon_linux.sh
 #
-# .env 설정 (Linux headless 서버):
-#   HEADLESS=true                         # 디스플레이 없는 서버
-#   HEADLESS=false                        # X11/Wayland 데스크탑
+# ── .env 필수 설정 (헤드리스 서버) ─────────────────────────────
+#   DH_LOGIN_ID=<동행복권 아이디>        # 자동 로그인에 필수
+#   DH_LOGIN_PW=<동행복권 비밀번호>      # 자동 로그인에 필수
+#   HEADLESS=true                        # EC2/서버 환경은 반드시 true
 #
-# Register as cron job (every Saturday 09:00):
+# ── cron 등록 (매주 토요일 09:00) ─────────────────────────────
 #   crontab -e
 #   0 9 * * 6 /bin/bash /path/to/mylotto-agent/weekly_lotto.sh >> /path/to/mylotto-agent/logs/cron.log 2>&1
 
@@ -38,7 +37,7 @@ cd "$PROJECT_DIR"
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 
-# .env 파일 로드 (HEADLESS 등 설정 반영)
+# .env 파일 로드 (HEADLESS, DH_LOGIN_ID, DH_LOGIN_PW 등 반영)
 if [ -f "$PROJECT_DIR/.env" ]; then
     set -a
     # shellcheck disable=SC1090
@@ -70,22 +69,37 @@ die() {
 
 # ── Python 및 venv 확인 ───────────────────────────────────────
 if [ ! -f "$PYTHON" ]; then
-    die "Python not found: $PYTHON  (run: python -m venv .venv && .venv/bin/pip install -r requirements.txt)"
+    die "Python not found: $PYTHON
+  최초 설정이 필요합니다:
+    bash scripts/setup_amazon_linux.sh     # Amazon Linux 2023
+    python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt  # 기타"
 fi
 
-log "=== Weekly lotto pipeline started ==="
+# ── 헤드리스 서버에서 자동 로그인 설정 경고 ──────────────────
+if [ "${HEADLESS}" = "true" ]; then
+    if [ -z "${DH_LOGIN_ID:-}" ] || [ -z "${DH_LOGIN_PW:-}" ]; then
+        echo ""
+        echo "[WARN] HEADLESS=true 이지만 DH_LOGIN_ID / DH_LOGIN_PW 가 설정되지 않았습니다."
+        echo "       buy-lotto 단계에서 로그인 대기 타임아웃이 발생합니다."
+        echo "       .env 파일에 DH_LOGIN_ID, DH_LOGIN_PW 를 추가하세요."
+        log "WARN: DH_LOGIN_ID or DH_LOGIN_PW not set (headless mode)"
+    fi
+fi
+
+log "=== Weekly lotto pipeline started (HEADLESS=${HEADLESS}) ==="
 
 # ─────────────────────────────────────────────────────────────
 # Step 1: Analyze (update number statistics)
+#   당첨번호 수집은 Step 4의 'run' 내부에서 자동 실행됨
 # ─────────────────────────────────────────────────────────────
-step 1 5 "Analyze number statistics"
+step 1 6 "Analyze number statistics"
 "$PYTHON" main.py analyze || die "analyze failed"
 log "analyze done"
 
 # ─────────────────────────────────────────────────────────────
 # Step 2: Build ML features
 # ─────────────────────────────────────────────────────────────
-step 2 5 "Build ML features (build-features)"
+step 2 6 "Build ML features (build-features)"
 if ! "$PYTHON" main.py build-features; then
     echo "  [WARN] build-features failed -- continuing without ML strategy."
     log "WARN: build-features failed (skipped)"
@@ -95,7 +109,7 @@ else
     # ─────────────────────────────────────────────────────────
     # Step 3: Retrain model
     # ─────────────────────────────────────────────────────────
-    step 3 5 "Retrain model (train-model)"
+    step 3 6 "Retrain model (train-model)"
     if ! "$PYTHON" main.py train-model; then
         echo "  [WARN] train-model failed -- continuing without ML strategy."
         log "WARN: train-model failed (skipped)"
@@ -105,20 +119,40 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────
-# Step 4: Generate 5 games (balanced_v2 x3 + random x2)
-#   collect runs automatically inside 'run'
-#   purchased combos are automatically excluded
+# Step 4: Collect + Generate 5 games (balanced_v2 x3 + random x2)
+#   collect: 최신 당첨번호 증분 수집
+#   generate: 구매 이력 번호 자동 제외
 # ─────────────────────────────────────────────────────────────
-step 4 5 "Generate 5 games"
+step 4 6 "Collect + Generate 5 games"
 "$PYTHON" main.py run --balanced-v2-games 3 --random-games 2 --balanced-games 0 || die "game generation failed"
 log "game generation done (5 games)"
 
 # ─────────────────────────────────────────────────────────────
 # Step 5: Auto-purchase (1 game at a time, 5 rounds)
+#   실제 금전 거래 발생 — DH_LOGIN_ID/DH_LOGIN_PW 필수
 # ─────────────────────────────────────────────────────────────
-step 5 5 "Auto-purchase (1 game x 5 rounds)"
+step 5 6 "Auto-purchase (1 game x 5 rounds)"
 "$PYTHON" main.py buy-lotto --max-games 5
-log "buy-lotto done"
+BUY_EXIT=$?
+if [ $BUY_EXIT -ne 0 ]; then
+    echo "  [WARN] buy-lotto exited with code $BUY_EXIT -- continuing to check-results"
+    log "WARN: buy-lotto exit=$BUY_EXIT"
+else
+    log "buy-lotto done"
+fi
+
+# ─────────────────────────────────────────────────────────────
+# Step 6: Check results (compare generated numbers vs actual draws)
+#   이전 회차 번호의 적중 결과를 prediction_results.csv 에 누적
+#   이번 주 구매분은 당첨 발표 전이므로 자동으로 스킵됨
+# ─────────────────────────────────────────────────────────────
+step 6 6 "Check results (feedback loop)"
+if ! "$PYTHON" main.py check-results; then
+    echo "  [WARN] check-results failed -- non-critical, skipping"
+    log "WARN: check-results failed (skipped)"
+else
+    log "check-results done"
+fi
 
 log "=== Weekly lotto pipeline finished ==="
 echo ""
