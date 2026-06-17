@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 # CSV 컬럼 정의
 DRAW_COLUMNS = ["round_no", "date", "num1", "num2", "num3", "num4", "num5", "num6", "bonus"]
 GAME_COLUMNS = [
-    "generated_at", "strategy", "game_no",
+    "generated_at", "strategy", "game_no", "target_round_no",
     "num1", "num2", "num3", "num4", "num5", "num6",
     "purchased", "purchased_at",
 ]
@@ -79,18 +79,27 @@ class LocalStorage:
         if not self.games_path.exists():
             return pd.DataFrame(columns=GAME_COLUMNS)
         df = pd.read_csv(self.games_path, dtype={"purchased_at": object})
-        # 기존 CSV에 purchased 컬럼 없으면 추가 (하위 호환)
+        # 기존 CSV 컬럼 없을 때 하위 호환 추가
         if "purchased" not in df.columns:
             df["purchased"] = False
         if "purchased_at" not in df.columns:
             df["purchased_at"] = ""
+        if "target_round_no" not in df.columns:
+            df["target_round_no"] = 0  # 마이그레이션 대상임을 0으로 표시
         # 빈 값으로 인해 float64로 추론된 경우 object로 강제 변환 (pandas 3.x 호환)
-        df["purchased_at"] = df["purchased_at"].fillna("").astype(object)
-        df["purchased"] = df["purchased"].fillna(False)
+        df["purchased_at"]   = df["purchased_at"].fillna("").astype(object)
+        df["purchased"]      = df["purchased"].fillna(False)
+        df["target_round_no"] = pd.to_numeric(df["target_round_no"], errors="coerce").fillna(0).astype(int)
         return df
 
     def save_games(self, df: pd.DataFrame) -> None:
-        """생성된 게임 DataFrame을 CSV로 저장한다 (덮어쓰기)."""
+        """생성된 게임 DataFrame을 CSV로 저장한다 (덮어쓰기).
+
+        GAME_COLUMNS 순서로 컬럼을 정렬하고 그 외 컬럼은 뒤에 붙인다.
+        """
+        ordered = [c for c in GAME_COLUMNS if c in df.columns]
+        extra   = [c for c in df.columns if c not in GAME_COLUMNS]
+        df = df[ordered + extra]
         df.to_csv(self.games_path, index=False, encoding="utf-8-sig")
         logger.info("생성 게임 %d개 저장: %s", len(df), self.games_path)
 

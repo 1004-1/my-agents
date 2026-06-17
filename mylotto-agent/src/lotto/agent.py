@@ -219,8 +219,9 @@ class LottoAgent:
             console.print("[red]생성할 게임이 없습니다.[/red]")
             return pd.DataFrame()
 
-        history      = self.storage.load_results()
-        generated_at = datetime.now(tz=timezone.utc).isoformat()
+        history          = self.storage.load_results()
+        generated_at     = datetime.now(tz=timezone.utc).isoformat()
+        target_round_no  = self.storage.get_latest_round() + 1
 
         # 이전 구매 번호 로드 (재사용 방지)
         purchased_combos = self.storage.get_purchased_combos()
@@ -265,13 +266,14 @@ class LottoAgent:
             # CSV 행 누적
             for game_no, numbers in enumerate(games, 1):
                 rows.append({
-                    "generated_at": generated_at,
-                    "strategy":     strategy_name,
-                    "game_no":      game_no,
+                    "generated_at":   generated_at,
+                    "strategy":       strategy_name,
+                    "game_no":        game_no,
+                    "target_round_no": target_round_no,
                     "num1": numbers[0], "num2": numbers[1], "num3": numbers[2],
                     "num4": numbers[3], "num5": numbers[4], "num6": numbers[5],
-                    "purchased":    False,
-                    "purchased_at": "",
+                    "purchased":      False,
+                    "purchased_at":   "",
                 })
 
         # ── 전략 간 종합 요약 ──────────────────────────────────────────────

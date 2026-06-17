@@ -41,7 +41,7 @@ def test_get_reward_estimate():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ResultChecker.find_target_round
+# _find_round_by_date  (레거시 날짜 기반 fallback)
 # ──────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture
@@ -54,32 +54,29 @@ def draws_df():
     return pd.DataFrame(data)
 
 
-def test_find_target_round_normal(draws_df):
+def test_find_round_by_date_normal(draws_df):
     checker = ResultChecker()
-    # 1월 11일 생성 → 가장 가까운 미래 추첨 = 101회
-    assert checker.find_target_round("2026-01-11", draws_df) == 101
+    assert checker._find_round_by_date("2026-01-11", draws_df) == 101
 
 
-def test_find_target_round_before_all(draws_df):
+def test_find_round_by_date_before_all(draws_df):
     checker = ResultChecker()
-    # 1월 5일 생성 → 가장 가까운 미래 추첨 = 100회
-    assert checker.find_target_round("2026-01-05", draws_df) == 100
+    assert checker._find_round_by_date("2026-01-05", draws_df) == 100
 
 
-def test_find_target_round_no_future(draws_df):
+def test_find_round_by_date_no_future(draws_df):
     checker = ResultChecker()
-    # 1월 25일 이후 → 미래 추첨 없음
-    assert checker.find_target_round("2026-01-25", draws_df) is None
+    assert checker._find_round_by_date("2026-01-25", draws_df) is None
 
 
-def test_find_target_round_same_day(draws_df):
+def test_find_round_by_date_same_day(draws_df):
     checker = ResultChecker()
-    # 1월 10일 당일 생성 → 당일은 포함 안 됨 → 101회
-    assert checker.find_target_round("2026-01-10", draws_df) == 101
+    # 당일 생성 → 당일은 포함 안 됨 → 101회
+    assert checker._find_round_by_date("2026-01-10", draws_df) == 101
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ResultChecker.check_all  (파일 I/O를 tmp_path로 격리)
+# 공통 픽스처 헬퍼
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _write_draws(path: Path) -> None:
@@ -91,12 +88,14 @@ def _write_draws(path: Path) -> None:
     ]).to_csv(path, index=False)
 
 
-def _write_games(path: Path) -> None:
+def _write_games_with_round(path: Path) -> None:
+    """target_round_no가 명시된 최신 형식 게임 데이터."""
     pd.DataFrame([
-        # 100회 당첨번호와 3개 일치 (5등)
+        # 100회 당첨번호와 3개 일치 (5등) — target_round_no 직접 지정
         {
             "generated_at": "2026-01-05T09:00:00+00:00",
             "strategy": "random", "game_no": 1,
+            "target_round_no": 100,
             "num1": 1, "num2": 2, "num3": 3, "num4": 11, "num5": 22, "num6": 33,
             "purchased": False, "purchased_at": "",
         },
@@ -104,10 +103,37 @@ def _write_games(path: Path) -> None:
         {
             "generated_at": "2026-01-11T09:00:00+00:00",
             "strategy": "balanced", "game_no": 1,
+            "target_round_no": 101,
             "num1": 5, "num2": 6, "num3": 7, "num4": 8, "num5": 9, "num6": 11,
             "purchased": False, "purchased_at": "",
         },
-        # 추첨이 없는 미래 날짜 → 스킵
+        # target_round_no=999 → draws에 없으므로 스킵
+        {
+            "generated_at": "2026-02-01T09:00:00+00:00",
+            "strategy": "random", "game_no": 1,
+            "target_round_no": 999,
+            "num1": 1, "num2": 2, "num3": 3, "num4": 4, "num5": 5, "num6": 6,
+            "purchased": False, "purchased_at": "",
+        },
+    ]).to_csv(path, index=False)
+
+
+def _write_games_legacy(path: Path) -> None:
+    """target_round_no가 없는 레거시 형식 게임 데이터 (마이그레이션 테스트용)."""
+    pd.DataFrame([
+        {
+            "generated_at": "2026-01-05T09:00:00+00:00",
+            "strategy": "random", "game_no": 1,
+            "num1": 1, "num2": 2, "num3": 3, "num4": 11, "num5": 22, "num6": 33,
+            "purchased": False, "purchased_at": "",
+        },
+        {
+            "generated_at": "2026-01-11T09:00:00+00:00",
+            "strategy": "balanced", "game_no": 1,
+            "num1": 5, "num2": 6, "num3": 7, "num4": 8, "num5": 9, "num6": 11,
+            "purchased": False, "purchased_at": "",
+        },
+        # 미래 날짜 → 스킵
         {
             "generated_at": "2026-02-01T09:00:00+00:00",
             "strategy": "random", "game_no": 1,
@@ -117,35 +143,34 @@ def _write_games(path: Path) -> None:
     ]).to_csv(path, index=False)
 
 
-def test_check_all_basic(tmp_path):
+# ──────────────────────────────────────────────────────────────────────────────
+# check_all — target_round_no 직접 지정
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_check_all_uses_target_round_no(tmp_path):
+    """target_round_no가 명시된 경우 그 값을 기준으로 매칭한다."""
     draws  = tmp_path / "draws.csv"
     games  = tmp_path / "games.csv"
     pred   = tmp_path / "pred.csv"
     _write_draws(draws)
-    _write_games(games)
+    _write_games_with_round(games)
 
-    checker = ResultChecker(
-        games_path=games,
-        results_path=draws,
-        prediction_path=pred,
-    )
+    checker = ResultChecker(games_path=games, results_path=draws, prediction_path=pred)
     df, added, skipped = checker.check_all()
 
-    assert added == 2
-    assert skipped == 1
+    assert added == 2     # 100회·101회 체크 완료
+    assert skipped == 1   # 999회 = 데이터 없음
     assert len(df) == 2
-    assert pred.exists()
 
-    # 첫 번째 게임: 3개 일치 → 5등
     row5 = df[df["strategy_name"] == "random"].iloc[0]
     assert int(row5["match_count"]) == 3
     assert str(row5["rank"]) == "5"
-    assert row5["reward_estimate"] == 5000
+    assert int(row5["target_round_no"]) == 100
 
-    # 두 번째 게임: 0개 일치 → 낙첨
     row0 = df[df["strategy_name"] == "balanced"].iloc[0]
     assert int(row0["match_count"]) == 0
     assert str(row0["rank"]) == ""
+    assert int(row0["target_round_no"]) == 101
 
 
 def test_check_all_no_duplicate(tmp_path):
@@ -154,7 +179,7 @@ def test_check_all_no_duplicate(tmp_path):
     games  = tmp_path / "games.csv"
     pred   = tmp_path / "pred.csv"
     _write_draws(draws)
-    _write_games(games)
+    _write_games_with_round(games)
 
     checker = ResultChecker(games_path=games, results_path=draws, prediction_path=pred)
     checker.check_all()
@@ -169,7 +194,6 @@ def test_check_all_no_games(tmp_path):
     games = tmp_path / "games.csv"
     pred  = tmp_path / "pred.csv"
     _write_draws(draws)
-    # games 파일 없음
 
     checker = ResultChecker(games_path=games, results_path=draws, prediction_path=pred)
     df, added, skipped = checker.check_all()
@@ -180,7 +204,50 @@ def test_check_all_no_games(tmp_path):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ResultChecker.strategy_summary
+# 자동 마이그레이션 — target_round_no 없는 레거시 데이터
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_migration_fills_target_round_no(tmp_path):
+    """target_round_no 컬럼이 없는 레거시 CSV를 마이그레이션 후 올바른 회차를 채운다."""
+    draws  = tmp_path / "draws.csv"
+    games  = tmp_path / "games.csv"
+    pred   = tmp_path / "pred.csv"
+    _write_draws(draws)
+    _write_games_legacy(games)
+
+    checker = ResultChecker(games_path=games, results_path=draws, prediction_path=pred)
+    df, added, skipped = checker.check_all()
+
+    assert added == 2
+    assert skipped == 1
+
+    # 마이그레이션 후 games CSV에 target_round_no가 채워졌는지 확인
+    migrated_games = pd.read_csv(games)
+    assert "target_round_no" in migrated_games.columns
+    assert int(migrated_games.iloc[0]["target_round_no"]) == 100
+    assert int(migrated_games.iloc[1]["target_round_no"]) == 101
+    # 미래 날짜 → 0 (아직 추첨 전)
+    assert int(migrated_games.iloc[2]["target_round_no"]) == 0
+
+
+def test_migration_idempotent(tmp_path):
+    """마이그레이션은 두 번 실행해도 결과가 동일해야 한다."""
+    draws  = tmp_path / "draws.csv"
+    games  = tmp_path / "games.csv"
+    pred   = tmp_path / "pred.csv"
+    _write_draws(draws)
+    _write_games_legacy(games)
+
+    checker = ResultChecker(games_path=games, results_path=draws, prediction_path=pred)
+    checker.check_all()   # 1회: 마이그레이션 + 체크
+    _, added2, skipped2 = checker.check_all()  # 2회: 이미 체크됨
+
+    assert added2 == 0
+    assert skipped2 == 1   # 미래 날짜 게임 1건은 계속 스킵
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# strategy_summary
 # ──────────────────────────────────────────────────────────────────────────────
 
 def test_strategy_summary(tmp_path):

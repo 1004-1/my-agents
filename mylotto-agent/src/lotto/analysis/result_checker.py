@@ -89,13 +89,42 @@ class ResultChecker:
         )
 
     # ──────────────────────────────────────────────────────────────────────
+    # 마이그레이션 (target_round_no == 0 인 기존 행 자동 보정)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _migrate_target_round_no(
+        self, games_df: pd.DataFrame, draws_df: pd.DataFrame
+    ) -> tuple[pd.DataFrame, int]:
+        """target_round_no가 0인 레거시 행을 날짜 기반으로 채우고 CSV를 갱신한다.
+
+        Returns:
+            (갱신된_games_df, 마이그레이션된_행_수)
+        """
+        mask = games_df["target_round_no"] == 0
+        if not mask.any():
+            return games_df, 0
+
+        games_df = games_df.copy()
+        for idx in games_df.index[mask]:
+            trn = self._find_round_by_date(str(games_df.at[idx, "generated_at"]), draws_df)
+            games_df.at[idx, "target_round_no"] = trn if trn is not None else 0
+
+        migrated = int(mask.sum())
+        # LocalStorage.save_games()를 통해 컬럼 순서 정렬 후 저장
+        from ..storage.local_storage import LocalStorage
+        st = LocalStorage(results_path=self.results_path, games_path=self.games_path)
+        st.save_games(games_df)
+        logger.info("target_round_no 마이그레이션: %d행", migrated)
+        return games_df, migrated
+
+    # ──────────────────────────────────────────────────────────────────────
     # 핵심 로직
     # ──────────────────────────────────────────────────────────────────────
 
-    def find_target_round(
+    def _find_round_by_date(
         self, generated_at: str, draws_df: pd.DataFrame
     ) -> int | None:
-        """generated_at 이후 가장 가까운 추첨 회차를 반환한다.
+        """generated_at 이후 가장 가까운 추첨 회차를 반환한다 (레거시 fallback).
 
         추첨이 아직 없으면 None.
         """
@@ -118,12 +147,17 @@ class ResultChecker:
         Returns:
             (전체_prediction_df, 새로_추가된_수, 미추첨으로_건너뛴_수)
         """
-        games_df   = self._load_games()
-        draws_df   = self._load_draws()
-        existing   = self.load_predictions()
+        games_df = self._load_games()
+        draws_df = self._load_draws()
+        existing = self.load_predictions()
 
         if games_df.empty:
             return existing, 0, 0
+
+        # target_round_no == 0 인 레거시 행 자동 마이그레이션
+        games_df, n_migrated = self._migrate_target_round_no(games_df, draws_df)
+        if n_migrated:
+            logger.info("마이그레이션 완료: %d행에 target_round_no 보정", n_migrated)
 
         # 이미 체크된 키 집합 (generated_at + numbers)
         if not existing.empty:
@@ -145,13 +179,16 @@ class ResultChecker:
             if key in existing_keys:
                 continue
 
-            target_round = self.find_target_round(str(row["generated_at"]), draws_df)
-            if target_round is None:
+            # target_round_no를 games CSV에서 직접 사용
+            target_round = int(row["target_round_no"])
+            if target_round == 0:
+                # 마이그레이션 후에도 0이면 아직 추첨 전
                 skipped += 1
                 continue
 
             draw_row = draws_df[draws_df["round_no"] == target_round]
             if draw_row.empty:
+                # 회차 데이터가 없으면 아직 추첨 전
                 skipped += 1
                 continue
 
@@ -165,17 +202,17 @@ class ResultChecker:
             reward        = get_reward_estimate(rank)
 
             new_rows.append({
-                "generated_at":   row["generated_at"],
+                "generated_at":    row["generated_at"],
                 "target_round_no": target_round,
-                "strategy_name":  row["strategy"],
-                "numbers":        numbers,
+                "strategy_name":   row["strategy"],
+                "numbers":         numbers,
                 "winning_numbers": ",".join(str(n) for n in winning),
-                "bonus":          bonus,
-                "match_count":    match_count,
-                "bonus_matched":  bonus_matched,
-                "rank":           rank if rank is not None else "",
+                "bonus":           bonus,
+                "match_count":     match_count,
+                "bonus_matched":   bonus_matched,
+                "rank":            rank if rank is not None else "",
                 "reward_estimate": reward,
-                "checked_at":     now,
+                "checked_at":      now,
             })
 
         if new_rows:
@@ -212,18 +249,18 @@ class ResultChecker:
                 grp["rank_int"].dropna().astype(int).value_counts().to_dict()
             )
             rows.append({
-                "strategy":      strategy,
-                "total_games":   len(grp),
-                "avg_match":     round(grp["match_count"].mean(), 3),
-                "match_3plus":   int((grp["match_count"] >= 3).sum()),
-                "match_4plus":   int((grp["match_count"] >= 4).sum()),
-                "match_5plus":   int((grp["match_count"] >= 5).sum()),
-                "max_match":     int(grp["match_count"].max()),
-                "rank_5":        rank_dist.get(5, 0),
-                "rank_4":        rank_dist.get(4, 0),
-                "rank_3":        rank_dist.get(3, 0),
-                "rank_2":        rank_dist.get(2, 0),
-                "rank_1":        rank_dist.get(1, 0),
+                "strategy":    strategy,
+                "total_games": len(grp),
+                "avg_match":   round(grp["match_count"].mean(), 3),
+                "match_3plus": int((grp["match_count"] >= 3).sum()),
+                "match_4plus": int((grp["match_count"] >= 4).sum()),
+                "match_5plus": int((grp["match_count"] >= 5).sum()),
+                "max_match":   int(grp["match_count"].max()),
+                "rank_5":      rank_dist.get(5, 0),
+                "rank_4":      rank_dist.get(4, 0),
+                "rank_3":      rank_dist.get(3, 0),
+                "rank_2":      rank_dist.get(2, 0),
+                "rank_1":      rank_dist.get(1, 0),
             })
 
         return pd.DataFrame(rows).sort_values("avg_match", ascending=False)
