@@ -10,17 +10,27 @@
 #   [5] buy-lotto        auto-purchase (1 game x 5 rounds)
 #   [6] check-results    compare vs actual draw results (accumulated feedback)
 #
+# ── macOS (Mac Mini) 최초 설정 ──────────────────────────────────
+#   python3.12 -m venv .venv
+#   .venv/bin/pip install -r requirements.txt
+#   .venv/bin/playwright install chromium
+#   cp .env.example .env   # 그 후 .env에 DH_LOGIN_ID/PW 입력
+#
 # ── Amazon Linux 2023 최초 설정 ─────────────────────────────────
 #   bash scripts/setup_amazon_linux.sh
 #
-# ── .env 필수 설정 (헤드리스 서버) ─────────────────────────────
+# ── .env 필수 설정 ──────────────────────────────────────────────
 #   DH_LOGIN_ID=<동행복권 아이디>        # 자동 로그인에 필수
 #   DH_LOGIN_PW=<동행복권 비밀번호>      # 자동 로그인에 필수
-#   HEADLESS=true                        # EC2/서버 환경은 반드시 true
+#   HEADLESS=false                       # macOS: 브라우저 창 표시 (기본)
+#   HEADLESS=true                        # 서버/무인 환경
 #
-# ── cron 등록 (매주 토요일 09:00) ─────────────────────────────
+# ── macOS cron 등록 (매주 토요일 09:00 KST) ──────────────────
 #   crontab -e
-#   0 9 * * 6 /bin/bash /path/to/mylotto-agent/weekly_lotto.sh >> /path/to/mylotto-agent/logs/cron.log 2>&1
+#   0 9 * * 6 /bin/bash /Users/soft1003/MyAgents/agents-in-github/mylotto-agent/weekly_lotto.sh >> /Users/soft1003/MyAgents/agents-in-github/mylotto-agent/logs/cron.log 2>&1
+#
+# ── (선택) macOS launchd 등록 ──────────────────────────────────
+#   scripts/setup_macos_launchd.sh
 
 set -uo pipefail
 
@@ -45,8 +55,12 @@ if [ -f "$PROJECT_DIR/.env" ]; then
     set +a
 fi
 
-# HEADLESS 미설정 시 Linux 기본값은 true (디스플레이 없는 환경 대비)
-export HEADLESS="${HEADLESS:-true}"
+# HEADLESS 기본값: macOS는 false(브라우저 창 표시), 그 외는 true
+if [ "$(uname)" = "Darwin" ]; then
+    export HEADLESS="${HEADLESS:-false}"
+else
+    export HEADLESS="${HEADLESS:-true}"
+fi
 
 # ── 유틸 함수 ─────────────────────────────────────────────────
 log() {
