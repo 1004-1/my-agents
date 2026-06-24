@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import base64
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -23,14 +24,26 @@ SCOPES = [
 LABEL_NAME = "Meco_3631eff2-09a3-465b-8569-8d6e623ef8f3"
 
 OLLAMA_MODEL = "llama3.1:8b"
-MAX_BODY_CHARS = 8000
+MAX_BODY_CHARS = 12000
+MAX_REPORT_CHARS = 90000
 TIMEZONE = ZoneInfo("Asia/Seoul")
 
 DRY_RUN_DELETE = False
 
 
+def log(message):
+    now = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {message}", flush=True)
+
+
 def contains_chinese(text):
-    return bool(re.search(r"[\u4e00-\u9fff]", text))
+    return bool(re.search(r"[一-鿿]", text))
+
+
+def is_korean_email(subject, body):
+    text = subject + " " + body[:2000]
+    korean_chars = len(re.findall(r"[가-힣ᄀ-ᇿ㄰-㆏]", text))
+    return korean_chars >= 20
 
 
 def clean_text(text):
@@ -75,15 +88,14 @@ def build_summary_prompt(subject, sender, body, retry=False):
 아래 뉴스레터를 정리하라.
 
 작업 규칙:
-- 원문이 한국어이면 전체 내용을 약 70% 수준으로 자세히 요약한다.
-- 원문이 영어이면 전체를 한국어로 번역한다.
-- AI, 데이터, 개발, 클라우드, 투자 관련 전문 용어는 원문을 유지한다.
-- 제품명, 회사명, 서비스명, API명, 프로그래밍 언어명은 번역하지 않는다.
-- 한국어 독자가 이해하기 어려운 경우에만 괄호 안에 간단한 설명을 추가한다.
-- 위 작업 규칙은 결과에 출력하지 않는다.
 - 결과는 반드시 한국어로만 작성한다.
+- 원문이 한국어이면 전체 내용을 약 70% 수준으로 자세히 요약한다.
+- 원문이 영어이면 전체 내용을 한국어로 번역하되, 기술 용어는 억지로 번역하지 않는다.
+- 회사명, 제품명, 서비스명, API명, 프로그래밍 언어명, 오픈소스 프로젝트명은 원문을 유지한다.
 - 광고, 수신거부, 구독 안내, 단순 링크 문구는 제외한다.
-- 원문의 의미를 왜곡하지 않는다.
+- 원문에 없는 내용을 추측해서 추가하지 않는다.
+- 중요한 숫자, 날짜, 인물, 기업명, 제품명, 사례는 가능한 유지한다.
+- 아래 작업 규칙은 출력하지 않는다.
 
 {retry_notice}
 
@@ -92,7 +104,16 @@ def build_summary_prompt(subject, sender, body, retry=False):
 ## 제목
 {subject}
 
-## 내용
+## 전체 정리
+원문의 흐름을 따라 문단 단위로 자세히 정리한다.
+
+## 주요 내용
+- 핵심 내용을 5~10개 bullet로 정리한다.
+
+## 기억할 만한 표현/용어
+- 중요한 기술 용어, 기업명, 제품명, 개념을 정리한다.
+
+{retry_notice}
 
 [원문]
 {body}
@@ -124,7 +145,11 @@ def summarize_with_ollama(subject, sender, body):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
-        options={"temperature": 0.2, "top_p": 0.9},
+        options={
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "num_predict": 3000,
+        },
     )
 
     summary = response["message"]["content"].strip()
@@ -137,11 +162,16 @@ def summarize_with_ollama(subject, sender, body):
             messages=[
                 {
                     "role": "system",
-                    "content": system_prompt + "\n중국어가 포함되면 실패입니다. 반드시 한국어만 출력하세요.",
+                    "content": system_prompt
+                    + "\n중국어가 포함되면 실패입니다. 반드시 한국어만 출력하세요.",
                 },
                 {"role": "user", "content": retry_prompt},
             ],
-            options={"temperature": 0.1, "top_p": 0.8},
+            options={
+                "temperature": 0.1,
+                "top_p": 0.8,
+                "num_predict": 1800,
+            },
         )
 
         summary = response["message"]["content"].strip()
@@ -255,7 +285,7 @@ def list_all_label_messages(service, label_id):
     page_token = None
 
     while True:
-        request = (
+        result = (
             service.users()
             .messages()
             .list(
@@ -264,9 +294,9 @@ def list_all_label_messages(service, label_id):
                 maxResults=500,
                 pageToken=page_token,
             )
+            .execute()
         )
 
-        result = request.execute()
         messages.extend(result.get("messages", []))
 
         page_token = result.get("nextPageToken")
@@ -285,84 +315,74 @@ def load_full_message(service, message_id):
     )
 
 
-def gmail_message_link_from_headers(headers, fallback_message_id):
-    rfc_message_id = get_header(headers, "Message-ID")
-
-    if rfc_message_id:
-        encoded = (
-            rfc_message_id
-            .replace("<", "%3C")
-            .replace(">", "%3E")
-            .replace("@", "%40")
-        )
-        return f"https://mail.google.com/mail/u/0/#search/rfc822msgid%3A{encoded}"
-
-    return f"https://mail.google.com/mail/u/0/#inbox/{fallback_message_id}"
-
-
-def send_summary_email(service, to_email, subject, body_text):
+def send_summary_email(service, to_email, subject, body_text, max_retries=3):
     message = MIMEText(body_text, "plain", "utf-8")
     message["to"] = to_email
     message["subject"] = subject
 
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
 
-    result = (
-        service.users()
-        .messages()
-        .send(userId="me", body={"raw": raw})
-        .execute()
-    )
+    last_error = None
 
-    print("Gmail send result:", result)
-    return result
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = (
+                service.users()
+                .messages()
+                .send(userId="me", body={"raw": raw})
+                .execute()
+            )
+            log(f"Gmail send result: {result}")
+            return result
+
+        except Exception as e:
+            last_error = e
+            log(f"[WARN] Gmail send failed. retry={attempt}/{max_retries}, error={repr(e)}")
+
+            if attempt < max_retries:
+                time.sleep(10 * attempt)
+
+    raise last_error
 
 
 def trash_message(service, message_id):
-    service.users().messages().trash(
-        userId="me",
-        id=message_id,
-    ).execute()
+    service.users().messages().trash(userId="me", id=message_id).execute()
 
 
 def main():
+    job_start_time = time.time()
+
     service = get_service()
     my_email = get_my_email(service)
     label_id = find_label_id(service, LABEL_NAME)
 
-    summarize_start, summarize_end = get_summary_window()
-
-    print(f"내 Gmail: {my_email}")
-    print(f"Meco Label ID: {label_id}")
-    print(f"남길 메일 기준: {summarize_start} ~ {summarize_end}")
-    print(f"DRY_RUN_DELETE: {DRY_RUN_DELETE}")
+    log(f"내 Gmail: {my_email}")
+    log(f"Meco Label ID: {label_id}")
+    log(f"DRY_RUN_DELETE: {DRY_RUN_DELETE}")
 
     candidates = list_all_label_messages(service, label_id)
 
     summarize_items = []
-    delete_items = []
 
     for item in candidates:
         msg = load_full_message(service, item["id"])
-        received_at = internal_date_to_datetime(msg)
+        summarize_items.append(msg)
 
-        if summarize_start <= received_at <= summarize_end:
-            summarize_items.append(msg)
-        else:
-            delete_items.append(msg)
+    log(f"\n전체 Meco 메일 수: {len(candidates)}")
+    log(f"요약 대상 메일 수: {len(summarize_items)}")
 
-    print(f"\n전체 Meco 메일 수: {len(candidates)}")
-    print(f"요약 및 보존 대상 메일 수: {len(summarize_items)}")
-    print(f"휴지통 이동 대상 메일 수: {len(delete_items)}")
+    korean_parts = []
+    english_parts = []
+    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    run_time = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
 
-    report_parts = []
-    report_parts.append("# 뉴스레터 요약")
-    report_parts.append("")
-    report_parts.append(
-        f"- 요약 기간: {summarize_start:%Y-%m-%d %H:%M:%S} ~ {summarize_end:%Y-%m-%d %H:%M:%S}"
-    )
-    report_parts.append(f"- 요약 메일 수: {len(summarize_items)}")
-    report_parts.append("")
+    for group_parts, label in [(korean_parts, "한글"), (english_parts, "영문")]:
+        group_parts.append(f"# 뉴스레터 요약 ({label})")
+        group_parts.append("")
+        group_parts.append(f"- 실행 시각: {run_time}")
+
+    korean_count = 0
+    english_count = 0
 
     for idx, msg in enumerate(summarize_items, start=1):
         headers = msg["payload"].get("headers", [])
@@ -370,57 +390,99 @@ def main():
         subject = get_header(headers, "Subject")
         sender = get_header(headers, "From")
         body = extract_body(msg["payload"])
-        message_id = msg["id"]
-        link = gmail_message_link_from_headers(headers, message_id)
 
-        print("\n" + "=" * 20)
-        print(f"[{idx}/{len(summarize_items)}]")
-        print("제목:", subject)
-        print("발신:", sender)
+        lang = "한글" if is_korean_email(subject, body) else "영문"
+
+        log("\n" + "=" * 20)
+        log(f"[{idx}/{len(summarize_items)}] [{lang}]")
+        log(f"제목: {subject}")
+        log(f"발신: {sender}")
+
+        start_time = time.time()
+        log(f"[START] summarize: {subject}")
 
         summary = summarize_with_ollama(subject, sender, body)
 
+        elapsed = time.time() - start_time
+        log(f"[DONE] summarize: {subject} / elapsed={elapsed:.1f}s")
+
         if contains_chinese(summary):
-            print("[경고] 최종 요약에 중국어가 포함되어 있습니다.")
+            log("[경고] 최종 요약에 중국어가 포함되어 있습니다.")
 
-        report_parts.append("=" * 20)
-        report_parts.append(f"## {idx}. {subject}")
-        report_parts.append("")
-        report_parts.append(f"- 발신: {sender}")
-        # report_parts.append(f"- 원문 메일: {link}")
-        report_parts.append("")
-        report_parts.append(summary)
-        report_parts.append("")
+        if lang == "한글":
+            korean_count += 1
+            parts = korean_parts
+            num = korean_count
+        else:
+            english_count += 1
+            parts = english_parts
+            num = english_count
 
-    report_body = "\n".join(report_parts)
+        parts.append("=" * 20)
+        parts.append(f"## {num}. {subject}")
+        parts.append("")
+        parts.append(f"- 발신: {sender}")
+        parts.append("")
+        parts.append(summary)
+        parts.append("")
 
-    today = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    mail_subject = f"[뉴스레터 요약] {today}"
+    korean_parts.insert(3, f"- 요약 메일 수: {korean_count}")
+    korean_parts.insert(4, "")
+    english_parts.insert(3, f"- 요약 메일 수: {english_count}")
+    english_parts.insert(4, "")
 
-    send_summary_email(
-        service=service,
-        to_email=my_email,
-        subject=mail_subject,
-        body_text=report_body,
-    )
+    def truncate_report(parts):
+        body = "\n".join(parts)
+        if len(body) > MAX_REPORT_CHARS:
+            body = body[:MAX_REPORT_CHARS]
+            body += "\n\n[알림] 요약 메일 본문이 너무 길어 일부가 잘렸습니다."
+        return body
 
-    print(f"\n요약 메일 발송 완료: {my_email}")
+    send_start_time = time.time()
 
-    print("\n휴지통 이동 처리 시작")
+    if korean_count > 0:
+        log("[START] send Korean summary email")
+        send_summary_email(
+            service=service,
+            to_email=my_email,
+            subject=f"[뉴스레터 요약 - 한글] {today}",
+            body_text=truncate_report(korean_parts),
+        )
+        log(f"[DONE] 한글 요약 메일 발송 완료: {my_email}")
+    else:
+        log("한글 뉴스레터 없음 — 발송 생략")
 
-    for msg in delete_items:
+    if english_count > 0:
+        log("[START] send English summary email")
+        send_summary_email(
+            service=service,
+            to_email=my_email,
+            subject=f"[뉴스레터 요약 - 영문] {today}",
+            body_text=truncate_report(english_parts),
+        )
+        log(f"[DONE] 영문 요약 메일 발송 완료: {my_email}")
+    else:
+        log("영문 뉴스레터 없음 — 발송 생략")
+
+    send_elapsed = time.time() - send_start_time
+    log(f"[DONE] send all summary emails / elapsed={send_elapsed:.1f}s")
+
+    log("\n휴지통 이동 처리 시작")
+
+    for msg in summarize_items:
         headers = msg["payload"].get("headers", [])
         subject = get_header(headers, "Subject")
         message_id = msg["id"]
         received_at = internal_date_to_datetime(msg)
 
         if DRY_RUN_DELETE:
-            print(f"[DRY RUN] 휴지통 이동 예정: {received_at:%Y-%m-%d %H:%M:%S} / {subject}")
+            log(f"[DRY RUN] 휴지통 이동 예정: {received_at:%Y-%m-%d %H:%M:%S} / {subject}")
         else:
             trash_message(service, message_id)
-            print(f"휴지통 이동 완료: {received_at:%Y-%m-%d %H:%M:%S} / {subject}")
+            log(f"휴지통 이동 완료: {received_at:%Y-%m-%d %H:%M:%S} / {subject}")
 
-    print("\n완료")
+    total_elapsed = time.time() - job_start_time
+    log(f"\n완료 / total_elapsed={total_elapsed:.1f}s")
 
 
 if __name__ == "__main__":
