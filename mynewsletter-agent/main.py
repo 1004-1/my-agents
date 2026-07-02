@@ -1,19 +1,29 @@
 import os
 import re
+import sys
 import time
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
 
 import ollama
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
+load_dotenv()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN_PATH = os.path.join(BASE_DIR, "token.json")
+CREDENTIALS_PATH = os.path.join(BASE_DIR, "credentials.json")
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -23,12 +33,15 @@ SCOPES = [
 
 LABEL_NAME = "Meco_3631eff2-09a3-465b-8569-8d6e623ef8f3"
 
+GEMINI_MODEL = "gemini-2.5-flash"
 OLLAMA_MODEL = "llama3.1:8b"
 MAX_BODY_CHARS = 12000
 MAX_REPORT_CHARS = 90000
 TIMEZONE = ZoneInfo("Asia/Seoul")
 
 DRY_RUN_DELETE = False
+
+_gemini_client = None
 
 
 def log(message):
@@ -75,7 +88,7 @@ def clean_text(text):
     return "\n".join(lines)
 
 
-def build_summary_prompt(subject, sender, body, retry=False):
+def build_summary_prompt(subject, body, retry=False):
     retry_notice = ""
 
     if retry:
@@ -85,21 +98,19 @@ def build_summary_prompt(subject, sender, body, retry=False):
 """
 
     return f"""
-아래 뉴스레터를 정리하라.
+아래 뉴스레터를 처리하라. 먼저 원문의 언어를 판별한 뒤, 아래 두 방식 중 해당하는 방식을 그대로 따른다.
 
-작업 규칙:
+공통 규칙:
 - 결과는 반드시 한국어로만 작성한다.
-- 원문이 한국어이면 전체 내용을 약 70% 수준으로 자세히 요약한다.
-- 원문이 영어이면 전체 내용을 한국어로 번역하되, 기술 용어는 억지로 번역하지 않는다.
-- 회사명, 제품명, 서비스명, API명, 프로그래밍 언어명, 오픈소스 프로젝트명은 원문을 유지한다.
+- 회사명, 제품명, 서비스명, API명, 프로그래밍 언어명, 오픈소스 프로젝트명은 번역하지 않는다.
 - 광고, 수신거부, 구독 안내, 단순 링크 문구는 제외한다.
 - 원문에 없는 내용을 추측해서 추가하지 않는다.
-- 중요한 숫자, 날짜, 인물, 기업명, 제품명, 사례는 가능한 유지한다.
+- 중요한 숫자, 날짜, 인물, 기업명, 제품명, 사례는 반드시 유지한다.
 - 아래 작업 규칙은 출력하지 않는다.
 
-{retry_notice}
-
-출력 형식:
+[원문이 한국어인 경우]
+- 전체 내용을 약 80% 수준으로 자세히 요약한다.
+- 출력 형식:
 
 ## 제목
 {subject}
@@ -108,10 +119,24 @@ def build_summary_prompt(subject, sender, body, retry=False):
 원문의 흐름을 따라 문단 단위로 자세히 정리한다.
 
 ## 주요 내용
-- 핵심 내용을 5~10개 bullet로 정리한다.
+- 핵심 내용을 5개이상의 bullet로 정리한다.
 
 ## 기억할 만한 표현/용어
 - 중요한 기술 용어, 기업명, 제품명, 개념을 정리한다.
+
+[원문이 영어(또는 기타 외국어)인 경우]
+- 요약하지 않는다. bullet 요약, "주요 내용" 정리를 만들지 않는다.
+- 원문 전체를 빠짐없이 자연스러운 한국어로 번역한다. 생략하지 않는다.
+- 원문의 문단 구조와 흐름을 그대로 유지한다.
+- 각 문단의 모든 세부 내용, 예시, 수치, 사례를 빠짐없이 옮긴다.
+- AI, 데이터, 개발, 클라우드, 투자 관련 전문 용어는 원문을 그대로 유지한다.
+- 출력 형식:
+
+## 제목
+{subject}
+
+## 번역
+원문을 문단 단위로 빠짐없이 번역한다. 요약이나 생략 없이 전체를 옮긴다.
 
 {retry_notice}
 
@@ -120,13 +145,7 @@ def build_summary_prompt(subject, sender, body, retry=False):
 """
 
 
-def summarize_with_ollama(subject, sender, body):
-    body = clean_text(body)
-    body = body[:MAX_BODY_CHARS]
-
-    system_prompt = """
-당신은 뉴스레터 정리 비서입니다.
-
+SUMMARY_SYSTEM_PROMPT = """당신은 뉴스레터 정리 비서입니다.
 규칙:
 1. 모든 출력은 반드시 한국어로 작성한다.
 2. 중국어, 일본어, 영어 문장을 출력하지 않는다.
@@ -134,10 +153,57 @@ def summarize_with_ollama(subject, sender, body):
 4. 원문의 의미를 왜곡하지 않는다.
 5. 규칙 자체는 출력하지 않는다.
 6. 기술 용어를 억지로 한글화하지 않는다.
-7. 회사명, 제품명, 서비스명, 기술 용어는 원문을 유지한다.
-"""
+7. 회사명, 제품명, 서비스명, 기술 용어는 원문을 유지한다."""
 
-    prompt = build_summary_prompt(subject, sender, body, retry=False)
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY가 .env에 설정되지 않았습니다.")
+        _gemini_client = genai.Client(api_key=api_key)
+    return _gemini_client
+
+
+def summarize_with_gemini(subject, body):
+    body = clean_text(body)
+    body = body[:MAX_BODY_CHARS]
+
+    prompt = build_summary_prompt(subject, body, retry=False)
+    client = _get_gemini_client()
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=SUMMARY_SYSTEM_PROMPT,
+            temperature=0.2,
+            top_p=0.9,
+            max_output_tokens=4096,
+        ),
+    )
+
+    return response.text.strip()
+
+
+def summarize(subject, body):
+    try:
+        summary = summarize_with_gemini(subject, body)
+        return summary, "gemini"
+    except Exception as e:
+        log(f"[Gemini] 실패 → Ollama fallback. error={repr(e)}")
+        summary = summarize_with_ollama(subject, body)
+        return summary, "ollama"
+
+
+def summarize_with_ollama(subject, body):
+    body = clean_text(body)
+    body = body[:MAX_BODY_CHARS]
+
+    system_prompt = SUMMARY_SYSTEM_PROMPT
+
+    prompt = build_summary_prompt(subject, body, retry=False)
 
     response = ollama.chat(
         model=OLLAMA_MODEL,
@@ -155,7 +221,7 @@ def summarize_with_ollama(subject, sender, body):
     summary = response["message"]["content"].strip()
 
     if contains_chinese(summary):
-        retry_prompt = build_summary_prompt(subject, sender, body, retry=True)
+        retry_prompt = build_summary_prompt(subject, body, retry=True)
 
         response = ollama.chat(
             model=OLLAMA_MODEL,
@@ -182,15 +248,29 @@ def summarize_with_ollama(subject, sender, body):
 def get_service():
     creds = None
 
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+    if os.path.exists(TOKEN_PATH):
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except RefreshError as e:
+                log(f"[ERROR] Google OAuth 토큰 갱신 실패: {e}")
+                log("[ERROR] 원인: refresh token이 만료되었거나 Google 계정에서 앱 접근이 취소되었습니다.")
+                log("[ERROR] 해결 방법: token.json을 삭제하고 재인증이 필요합니다.")
+                if os.path.exists(TOKEN_PATH):
+                    os.remove(TOKEN_PATH)
+                    log("[INFO] token.json을 삭제했습니다.")
+                log("[INFO] OAuth 재인증이 필요합니다. python main.py를 수동 실행하세요.")
+                sys.exit(1)
         else:
+            if not sys.stdin.isatty():
+                log("[ERROR] OAuth 인증 토큰이 없습니다.")
+                log("[INFO] OAuth 재인증이 필요합니다. python main.py를 수동 실행하세요.")
+                sys.exit(1)
             flow = InstalledAppFlow.from_client_secrets_file(
-                "credentials.json",
+                CREDENTIALS_PATH,
                 SCOPES,
             )
             creds = flow.run_local_server(
@@ -199,7 +279,7 @@ def get_service():
                 open_browser=False,
             )
 
-        with open("token.json", "w") as token:
+        with open(TOKEN_PATH, "w") as token:
             token.write(creds.to_json())
 
     return build("gmail", "v1", credentials=creds)
@@ -233,9 +313,33 @@ def extract_body(payload):
             return BeautifulSoup(content, "html.parser").get_text("\n")
         return content
 
+    parts = payload.get("parts", [])
+
+    if payload.get("mimeType") == "multipart/alternative":
+        # 같은 내용의 서로 다른 표현(plain/html)이므로 하나만 골라 중복을 피한다.
+        candidates = []
+
+        for part in parts:
+            mime_type = part.get("mimeType", "")
+            part_body = part.get("body", {})
+
+            if part_body.get("data") and mime_type == "text/plain":
+                candidates.append(decode_body(part_body["data"]))
+            elif part_body.get("data") and mime_type == "text/html":
+                content = decode_body(part_body["data"])
+                candidates.append(BeautifulSoup(content, "html.parser").get_text("\n"))
+            elif part.get("parts"):
+                nested = extract_body(part)
+                if nested:
+                    candidates.append(nested)
+
+        if not candidates:
+            return ""
+        return max(candidates, key=lambda t: len(t.strip()))
+
     texts = []
 
-    for part in payload.get("parts", []):
+    for part in parts:
         mime_type = part.get("mimeType", "")
         part_body = part.get("body", {})
 
@@ -258,21 +362,6 @@ def get_header(headers, target):
         if h["name"].lower() == target.lower():
             return h["value"]
     return ""
-
-
-def get_summary_window():
-    now = datetime.now(TIMEZONE)
-
-    today_7 = now.replace(hour=7, minute=0, second=0, microsecond=0)
-    if now < today_7:
-        today_7 = today_7 - timedelta(days=1)
-
-    yesterday_7 = today_7 - timedelta(days=1)
-
-    summarize_start = yesterday_7
-    summarize_end = today_7 - timedelta(seconds=1)
-
-    return summarize_start, summarize_end
 
 
 def internal_date_to_datetime(message):
@@ -365,8 +454,11 @@ def main():
     summarize_items = []
 
     for item in candidates:
-        msg = load_full_message(service, item["id"])
-        summarize_items.append(msg)
+        try:
+            msg = load_full_message(service, item["id"])
+            summarize_items.append(msg)
+        except Exception as e:
+            log(f"[WARN] 메일 로드 실패. id={item['id']}, error={repr(e)}")
 
     log(f"\n전체 Meco 메일 수: {len(candidates)}")
     log(f"요약 대상 메일 수: {len(summarize_items)}")
@@ -401,10 +493,10 @@ def main():
         start_time = time.time()
         log(f"[START] summarize: {subject}")
 
-        summary = summarize_with_ollama(subject, sender, body)
+        summary, used_model = summarize(subject, body)
 
         elapsed = time.time() - start_time
-        log(f"[DONE] summarize: {subject} / elapsed={elapsed:.1f}s")
+        log(f"[DONE] summarize: {subject} / model={used_model} / elapsed={elapsed:.1f}s")
 
         if contains_chinese(summary):
             log("[경고] 최종 요약에 중국어가 포함되어 있습니다.")
@@ -478,8 +570,11 @@ def main():
         if DRY_RUN_DELETE:
             log(f"[DRY RUN] 휴지통 이동 예정: {received_at:%Y-%m-%d %H:%M:%S} / {subject}")
         else:
-            trash_message(service, message_id)
-            log(f"휴지통 이동 완료: {received_at:%Y-%m-%d %H:%M:%S} / {subject}")
+            try:
+                trash_message(service, message_id)
+                log(f"휴지통 이동 완료: {received_at:%Y-%m-%d %H:%M:%S} / {subject}")
+            except Exception as e:
+                log(f"[WARN] 휴지통 이동 실패. id={message_id}, subject={subject}, error={repr(e)}")
 
     total_elapsed = time.time() - job_start_time
     log(f"\n완료 / total_elapsed={total_elapsed:.1f}s")
