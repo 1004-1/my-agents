@@ -3,9 +3,11 @@ Gemini API 단독 테스트 스크립트
 실행: python test_gemini.py
 """
 from dotenv import load_dotenv
-from main import summarize_with_gemini, summarize, log
 
 load_dotenv()
+
+from src.summarizer import summarize
+from src.text_utils import detect_language
 
 KOREAN_SAMPLE = {
     "subject": "[테스트] AI 뉴스레터 2024",
@@ -44,13 +46,37 @@ where document review workflows that previously took days can now be completed i
 }
 
 
+_LONG_PARAGRAPHS = [
+    ENGLISH_SAMPLE["body"].strip(),
+    """
+Amazon Web Services unveiled a new suite of generative AI tools aimed at reducing the
+operational overhead of running large language models in production. The announcement,
+made at their annual re:Invent conference, focused heavily on cost optimization and
+latency improvements for enterprise customers running mission-critical workloads.
+""".strip(),
+    """
+Meta's research division published a paper detailing advances in efficient model
+distillation, claiming a 60% reduction in inference cost while retaining 95% of the
+original model's benchmark performance across reasoning and coding tasks.
+""".strip(),
+]
+
+# CHUNK_SIZE(10000자)를 넘기기 위해 위 문단들을 반복해서 이어붙인다.
+LONG_ENGLISH_SAMPLE = {
+    "subject": "Weekly AI industry roundup (long edition)",
+    "sender": "newsletter@techdigest.com",
+    "body": "\n\n".join(_LONG_PARAGRAPHS * 15),
+}
+
+
 def test_single(label, sample):
     print(f"\n{'='*50}")
     print(f"테스트: {label}")
     print(f"제목: {sample['subject']}")
     print("=" * 50)
 
-    summary, model = summarize(sample["subject"], sample["body"])
+    language = detect_language(sample["subject"], sample["body"])
+    summary, model = summarize(sample["subject"], sample["sender"], sample["body"], language)
 
     print(f"\n[사용 모델: {model}]")
     print(f"\n--- 요약 결과 ---\n{summary}")
@@ -62,5 +88,6 @@ if __name__ == "__main__":
 
     test_single("한글 뉴스레터", KOREAN_SAMPLE)
     test_single("영문 뉴스레터", ENGLISH_SAMPLE)
+    test_single("긴 영문 뉴스레터 (chunk 분할 확인)", LONG_ENGLISH_SAMPLE)
 
     print("\n테스트 완료")
